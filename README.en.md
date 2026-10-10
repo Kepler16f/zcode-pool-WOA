@@ -100,10 +100,10 @@ Download the package for your platform from the [Releases](../../releases) page:
 
 | Platform | File |
 | --- | --- |
-| Windows | `*_x64-setup.exe` |
 | Windows (ARM64) | `*_arm64-setup.exe` |
-| macOS | `*_universal.dmg` |
-| Linux | `*.deb` / `*.AppImage` |
+
+This fork builds the Windows ARM64 installer only; for x64 / macOS / Linux use the
+upstream [Limitinfinitude/zcode-pool](https://github.com/Limitinfinitude/zcode-pool/releases) releases.
 
 The binaries are not code-signed, so the system may warn about an unknown publisher on first launch.
 

@@ -7,26 +7,10 @@ on:
 
 jobs:
   build:
-    name: build (${{ matrix.os }}${{ matrix.target != '' && format(' {0}', matrix.target) || '' }})
-    runs-on: ${{ matrix.os }}
+    name: build (windows-arm64)
+    runs-on: windows-latest
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            bundles: nsis
-            target: ''
-          - os: windows-latest
-            bundles: nsis
-            target: aarch64-pc-windows-msvc
-          - os: macos-latest
-            bundles: dmg
-            target: universal-apple-darwin
-          - os: ubuntu-22.04
-            bundles: deb,appimage
-            target: ''
     steps:
       - uses: actions/checkout@v4
 
@@ -36,18 +20,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Add macOS universal targets
-        if: matrix.os == 'macos-latest'
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-
       - name: Add Windows ARM64 target
-        if: matrix.target == 'aarch64-pc-windows-msvc'
         run: rustup target add aarch64-pc-windows-msvc
 
       # ring 在 Windows ARM64 上必须用 clang 编译 C 代码（MSVC cl.exe 不行）。
       # 镜像自带 LLVM，这里只做兜底：万一 clang 不在 PATH，把标准安装路径补进去。
       - name: Ensure clang for Windows ARM64
-        if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: pwsh
         run: |
           if (-not (Get-Command clang -ErrorAction SilentlyContinue) -and (Test-Path 'C:\Program Files\LLVM\bin')) {
@@ -57,12 +35,6 @@ jobs:
             'clang already available'
           }
 
-      - name: Linux system deps
-        if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-
       - run: npm install
 
       - name: Build & attach to Release
@@ -70,15 +42,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.2.4' }}
-          releaseName: 'Z·POOL ${{ github.ref_name }}'
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.2.3' }}
+          releaseName: 'Z·POOL v0.2.3 (Windows ARM64)'
           releaseBody: |
             ZCode 账号池 · Windows on ARM fork（zcode-pool-WOA）
 
             相比上游 [Limitinfinitude/zcode-pool](https://github.com/Limitinfinitude/zcode-pool) 的更新：
 
-            - **Windows ARM64 原生支持**：新增 `*_arm64-setup.exe` 安装包与 CI 交叉编译目标
-              `aarch64-pc-windows-msvc`，可在 Snapdragon X / Surface 等 ARM64 设备原生运行，无需 x64 模拟。
+            - **Windows ARM64 原生支持**：`aarch64-pc-windows-msvc` 原生构建，
+              可在 Snapdragon X / Surface 等 ARM64 设备原生运行，无需 x64 模拟。
               网关请求头 `x-platform` 改为按实际架构上报（x64 上取值不变）。
             - **登录国际站修复**：「授权登录走代理」贯穿 OAuth 全链路（授权初始化 / 登录窗口 / 换取令牌），
               未显式设置时自动跟随 Windows 系统代理；启用 socks5 代理支持。
@@ -86,9 +58,10 @@ jobs:
             - **ZCode 安装路径探测修复**：反代抽取系统提示词时补扫 `C:\Program Files (x86)\ZCode\`，
               修复 x64 版 ZCode 装在 (x86) 目录（ARM64 设备上的常见落点）时反代本地 503 的问题。
 
-            下载：Windows `*_x64-setup.exe` / `*_arm64-setup.exe` · macOS `*_universal.dmg` · Linux `*.deb` / `*.AppImage`
+            本 fork 仅构建 Windows ARM64 安装包；其他平台请使用上游
+            [Limitinfinitude/zcode-pool](https://github.com/Limitinfinitude/zcode-pool/releases) 的发布。
 
             程序未签名，首次运行系统可能提示来源未知。
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.target != '' && format('--target {0} ', matrix.target) || '' }}--bundles ${{ matrix.bundles }}
+          args: --target aarch64-pc-windows-msvc --bundles nsis

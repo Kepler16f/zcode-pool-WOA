@@ -5359,7 +5359,7 @@ dependencies = [
 
 [[package]]
 name = "zcode-pool"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",

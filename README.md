@@ -93,10 +93,10 @@ Z·POOL 是一个基于 Tauri 2 的桌面工具，把 ZCode / Z.ai 的多账号�
 
 | 平台 | 文件 |
 | --- | --- |
-| Windows | `*_x64-setup.exe`（安装包） |
 | Windows（ARM64） | `*_arm64-setup.exe`（安装包） |
-| macOS | `*_universal.dmg` |
-| Linux | `*.deb` / `*.AppImage` |
+
+本 fork 仅构建 Windows ARM64 安装包；x64 / macOS / Linux 请使用上游
+[Limitinfinitude/zcode-pool](https://github.com/Limitinfinitude/zcode-pool/releases) 的发布。
 
 程序未做代码签名，首次运行时系统可能提示来源未知。
 
