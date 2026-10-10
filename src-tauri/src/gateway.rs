@@ -41,7 +41,7 @@ const CLIENT_HEADERS: [(&str, &str); 17] = [
     ("x-client-timezone", "Asia/Shanghai"),
     ("x-os-category", "windows"),
     ("x-os-version", "10.0.26200"),
-    ("x-platform", "win32-x64"),
+    ("x-platform", "@PLATFORM@"),
     ("x-release-channel", "production"),
     ("x-title", "Z Code@electron"),
     ("x-zcode-agent", "glm"),
@@ -57,6 +57,8 @@ const CAPTCHA_REGION: &str = "cn";
 /// 请求头里的版本号是**客户端版本**（上游会看）。
 /// 以前这里是写死的 `3.14.3` —— 客户端一升到 3.14.4，上游就把我们当旧版本挡了。
 /// 现在统一从 `quota::zcode_app_version()` 取（它先查注册表，查不到用常量兜底）。
+/// x-platform 同理：写死 `win32-x64` 会在 ARM64 机器上露馅，改从
+/// `quota::client_platform()` 按实际架构取（x64 上取值与原先完全一致）。
 fn client_headers() -> Vec<(&'static str, String)> {
     let ver = crate::quota::zcode_app_version();
     CLIENT_HEADERS
@@ -65,6 +67,7 @@ fn client_headers() -> Vec<(&'static str, String)> {
             let v = match *v {
                 "@UA@" => format!("ZCode/{ver} ai-sdk/provider-utils/4.0.27 runtime/node.js/24"),
                 "@VER@" => ver.clone(),
+                "@PLATFORM@" => crate::quota::client_platform(),
                 other => other.to_string(),
             };
             (*k, v)

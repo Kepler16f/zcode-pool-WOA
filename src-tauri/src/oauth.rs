@@ -51,16 +51,13 @@ pub fn new_poll_token() -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn init_flow(provider: &str, mid: &str) -> Result<FlowInit, String> {
-    init_flow_at(FLOW_INIT_URL, provider, mid)
+pub fn init_flow(provider: &str, mid: &str, proxy: Option<&str>) -> Result<FlowInit, String> {
+    init_flow_at(FLOW_INIT_URL, provider, mid, proxy)
 }
 
-fn init_flow_at(url: &str, provider: &str, mid: &str) -> Result<FlowInit, String> {
+fn init_flow_at(url: &str, provider: &str, mid: &str, proxy: Option<&str>) -> Result<FlowInit, String> {
     let poll_token = new_poll_token();
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
-        .build();
+    let agent = oauth_agent(proxy)?;
     let mut req = agent.post(url);
     for (k, v) in quota::zai_oauth_headers_with_mid(&poll_token, Some(mid.to_string())).0 {
         req = req.set(&k, &v);
@@ -130,8 +127,8 @@ pub enum PollOutcome {
     Ready(Value),
 }
 
-pub fn poll_flow_once(url: &str, poll_token: &str, mid: &str) -> Result<PollOutcome, String> {
-    let agent = web_agent();
+pub fn poll_flow_once(url: &str, poll_token: &str, mid: &str, proxy: Option<&str>) -> Result<PollOutcome, String> {
+    let agent = oauth_agent(proxy)?;
     let mut req = agent.get(url);
     for (k, v) in quota::zai_oauth_headers_with_mid(poll_token, Some(mid.to_string())).0 {
         req = req.set(&k, &v);
@@ -307,11 +304,8 @@ pub fn parse_proxy_url(input: &str) -> Result<String, String> {
     Ok(format!("{scheme}://{host}:{port_num}"))
 }
 
-pub fn exchange_token(provider: &str, code: &str, state: &str, mid: &str) -> Result<Value, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
-        .build();
+pub fn exchange_token(provider: &str, code: &str, state: &str, mid: &str, proxy: Option<&str>) -> Result<Value, String> {
+    let agent = oauth_agent(proxy)?;
     let mut req = agent.post(TOKEN_URL);
     for (k, v) in quota::zai_oauth_headers_with_mid("", Some(mid.to_string())).0 {
         if k == "Authorization" {
@@ -472,6 +466,73 @@ fn web_agent() -> ureq::Agent {
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(15))
         .build()
+}
+
+/// OAuth 握手专用的 agent：可选挂代理。
+/// 为什么必须挂：`oauth/cli/init` 的 authorize_url 是服务端按**请求出口 IP**决定的，
+/// 国内出口拿到的就是国内版登录页；ureq 不读系统代理，直连等于把出口 IP 暴露给分流逻辑。
+pub fn oauth_agent(proxy: Option<&str>) -> Result<ureq::Agent, String> {
+    let mut ab = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20));
+    if let Some(u) = proxy {
+        let px = ureq::Proxy::new(u)
+            .map_err(|e| crate::i18n::trf("err.proxy.invalid", &[("e", &e.to_string())]))?;
+        ab = ab.proxy(px);
+    }
+    Ok(ab.build())
+}
+
+#[cfg(windows)]
+fn no_window(prog: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut c = std::process::Command::new(prog);
+    c.creation_flags(0x0800_0000);
+    c
+}
+
+/// 读 Windows 系统代理（Internet Settings 的 ProxyEnable / ProxyServer），返回规范化 URL。
+/// 仅在「登录代理」未显式设置时兜底：用户开了系统代理却没在应用里填，登录照样该走代理。
+/// ProxyServer 两种格式都处理：`host:port`（全局 http 代理）与 `http=h:p;https=h:p;socks=h:p`（按协议）。
+#[cfg(windows)]
+pub(crate) fn system_http_proxy() -> Option<String> {
+    let out = no_window("reg")
+        .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"])
+        .output()
+        .ok()?;
+    let txt = String::from_utf8_lossy(&out.stdout).to_string();
+    let enabled = txt
+        .lines()
+        .find(|l| l.contains("ProxyEnable"))
+        .and_then(|l| l.rsplit(' ').find(|t| !t.is_empty()))
+        .map(|v| v.eq_ignore_ascii_case("0x1"))
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let val = txt
+        .lines()
+        .find(|l| l.contains("ProxyServer"))
+        .and_then(|l| l.rsplit(' ').find(|t| !t.is_empty()))?;
+    if val.contains('=') {
+        let entry = |want: &str| {
+            val.split(';').find_map(|part| {
+                let (k, v) = part.split_once('=')?;
+                (k.trim() == want && !v.is_empty()).then(|| v.to_string())
+            })
+        };
+        // 我们的流量全是 https：优先 https 条目，其次 http，最后 socks
+        return entry("https")
+            .or_else(|| entry("http"))
+            .map(|v| format!("http://{v}"))
+            .or_else(|| entry("socks").map(|v| format!("socks5://{v}")));
+    }
+    (!val.is_empty()).then(|| format!("http://{val}"))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn system_http_proxy() -> Option<String> {
+    None
 }
 
 pub fn extract_access_token(provider: &str, raw: &Value) -> Option<String> {

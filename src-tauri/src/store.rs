@@ -506,6 +506,9 @@ pub fn client_path_candidates(os: &str) -> Vec<String> {
         ],
         "windows" => vec![
             r"C:\Program Files\ZCode\ZCode.exe".to_string(),
+            // x64 安装包在 ARM64 机器上会落到 (x86)；x86 老机器上也常装在这。
+            // 少这一条时反代抽不到 zcode.cjs，请求本地就 503（与代理无关）。
+            r"C:\Program Files (x86)\ZCode\ZCode.exe".to_string(),
             std::env::var("LOCALAPPDATA")
                 .map(|l| format!(r"{}\Programs\ZCode\ZCode.exe", l))
                 .unwrap_or_default(),

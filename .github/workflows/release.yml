@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    name: build (${{ matrix.os }})
+    name: build (${{ matrix.os }}${{ matrix.target != '' && format(' {0}', matrix.target) || '' }})
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -18,6 +18,9 @@ jobs:
           - os: windows-latest
             bundles: nsis
             target: ''
+          - os: windows-latest
+            bundles: nsis
+            target: aarch64-pc-windows-msvc
           - os: macos-latest
             bundles: dmg
             target: universal-apple-darwin
@@ -37,6 +40,23 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
+      - name: Add Windows ARM64 target
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        run: rustup target add aarch64-pc-windows-msvc
+
+      # ring 在 Windows ARM64 上必须用 clang 编译 C 代码（MSVC cl.exe 不行）。
+      # 镜像自带 LLVM，这里只做兜底：万一 clang 不在 PATH，把标准安装路径补进去。
+      - name: Ensure clang for Windows ARM64
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue) -and (Test-Path 'C:\Program Files\LLVM\bin')) {
+            Add-Content $env:GITHUB_PATH 'C:\Program Files\LLVM\bin'
+            'clang was not on PATH; added C:\Program Files\LLVM\bin'
+          } else {
+            'clang already available'
+          }
+
       - name: Linux system deps
         if: startsWith(matrix.os, 'ubuntu')
         run: |
@@ -50,20 +70,23 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.2.3' }}
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.2.4' }}
           releaseName: 'Z·POOL ${{ github.ref_name }}'
           releaseBody: |
-            本版修复 / 改进
+            ZCode 账号池 · Windows on ARM fork（zcode-pool-WOA）
 
-            - **系统提示词精简 84%**：上游只校验提示词的**开头**（从第 0 个字节逐字节比对到身份段末尾为止），
-              后面的段落可有可无。现在只发必需的两块，**7814 → 1253 字符**。
-              - **不再把本机路径写进每一次请求** —— 原先固定带上 `# Environment` 段，
-                含 `C:\Users\<用户名>\.zcode\workspace\default`。
-              - 去掉了客户端专属的 `::code-comment` 指令、`/<skill-name>` 走 Skill 工具等段落 ——
-                第三方客户端不认这些，模型照着吐出来就是幻觉。
-              - 上游实测仍为 **200**，行为不受影响。
+            相比上游 [Limitinfinitude/zcode-pool](https://github.com/Limitinfinitude/zcode-pool) 的更新：
 
-            下载：Windows `*_x64-setup.exe` · macOS `*_universal.dmg` · Linux `*.deb` / `*.AppImage`
+            - **Windows ARM64 原生支持**：新增 `*_arm64-setup.exe` 安装包与 CI 交叉编译目标
+              `aarch64-pc-windows-msvc`，可在 Snapdragon X / Surface 等 ARM64 设备原生运行，无需 x64 模拟。
+              网关请求头 `x-platform` 改为按实际架构上报（x64 上取值不变）。
+            - **登录国际站修复**：「授权登录走代理」贯穿 OAuth 全链路（授权初始化 / 登录窗口 / 换取令牌），
+              未显式设置时自动跟随 Windows 系统代理；启用 socks5 代理支持。
+              修复国内出口下登录被重定向到国内版、邮箱登录不可用的问题。
+            - **ZCode 安装路径探测修复**：反代抽取系统提示词时补扫 `C:\Program Files (x86)\ZCode\`，
+              修复 x64 版 ZCode 装在 (x86) 目录（ARM64 设备上的常见落点）时反代本地 503 的问题。
+
+            下载：Windows `*_x64-setup.exe` / `*_arm64-setup.exe` · macOS `*_universal.dmg` · Linux `*.deb` / `*.AppImage`
 
             程序未签名，首次运行系统可能提示来源未知。
           releaseDraft: true

@@ -1,13 +1,27 @@
-# Z·POOL
+# Z·POOL (Windows on ARM fork)
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB?logo=tauri&logoColor=white)](https://tauri.app)
-[![Release](https://img.shields.io/github/v/release/Limitinfinitude/zcode-pool?label=release)](../../releases)
+[![Release](https://img.shields.io/github/v/release/Kepler16f/zcode-pool-WOA?label=release)](../../releases)
 
 **简体中文** ｜ [English](README.en.md)
 
 Z·POOL 是一个基于 Tauri 2 的桌面工具，把 ZCode / Z.ai 的多账号登录身份、Outlook 邮箱池和各账号额度集中管理，
 并对外提供一个带 **Web 管理台**的本地代理接口，让 pi-agent、LobeChat 这类第三方应用直接吃上号池里的额度。
+
+## 本 fork 与原版的关系
+
+本仓库是 [Limitinfinitude/zcode-pool](https://github.com/Limitinfinitude/zcode-pool) 的 fork，名为 **zcode-pool-WOA**（Windows on ARM）。
+原版功能全部保留，针对 **ARM64 Windows 设备**（Snapdragon X、Surface Pro 9/11 等）与真实使用环境做了三项修复/增强：
+
+| 变更 | 原版的问题 | 本 fork 的做法 |
+| --- | --- | --- |
+| **Windows ARM64 原生支持** | CI 只产出 `*_x64-setup.exe`，ARM64 设备只能靠 x64 转译运行 | 新增 `aarch64-pc-windows-msvc` 交叉编译目标，Release 附带 `*_arm64-setup.exe`；`cc` 升级修复 ARM64 host 的 MSVC 发现；网关请求头 `x-platform` 改为按实际架构上报（x64 上取值不变） |
+| **登录国际站修复** | 「授权登录走代理」只代理登录窗口；但决定国际/国内版页面的 `oauth/cli/init` 请求在 Rust 侧**直连**，国内出口拿到的永远是 `authorize_url` 指向国内版（只有手机号登录） | 登录代理贯穿 OAuth 全链路（授权初始化 / 登录窗口 / 换取令牌）；未显式设置时自动跟随 Windows 系统代理（读注册表 Internet Settings）；并启用 socks5 代理支持（原实现只支持 http） |
+| **ZCode 安装路径探测修复** | 反代抽系统提示词时找不到 `resources\glm\zcode.cjs` 就本地直接 503——x64 版 ZCode 在 ARM64 机器上默认装到 `C:\Program Files (x86)\ZCode\`，不在原探测候选里 | `client_path_candidates` 补上 `(x86)` 路径；「切换账号」同样受益 |
+
+本地分发（`npm run dist`）同步适配：兼容交叉编译的 `target/<triple>/release` 产物目录，读 PE 头识别架构，
+非 x64 便携版自动带 `_arm64` 后缀，不会与 x64 产物混淆。
 
 ## 界面预览
 
@@ -80,6 +94,7 @@ Z·POOL 是一个基于 Tauri 2 的桌面工具，把 ZCode / Z.ai 的多账号�
 | 平台 | 文件 |
 | --- | --- |
 | Windows | `*_x64-setup.exe`（安装包） |
+| Windows（ARM64） | `*_arm64-setup.exe`（安装包） |
 | macOS | `*_universal.dmg` |
 | Linux | `*.deb` / `*.AppImage` |
 
@@ -87,13 +102,13 @@ Z·POOL 是一个基于 Tauri 2 的桌面工具，把 ZCode / Z.ai 的多账号�
 
 ### 从源码构建
 
-环境要求：Node.js 18 及以上、Rust stable，Windows 平台还需 GNU 工具链 `stable-x86_64-pc-windows-gnu`。
+环境要求：Node.js 18 及以上、Rust stable。Windows 上用默认 MSVC 工具链即可，x64 与 ARM64 设备都能原生构建；ARM64 设备还需安装 LLVM 并让 `clang` 出现在 PATH 里（`ring` 在 Windows ARM64 上用 clang 编译其 C 代码，MSVC 的 cl.exe 不行）。
 
 ```powershell
 npm install
 npm run build
 Set-Location src-tauri
-cargo +stable-x86_64-pc-windows-gnu build --release --features tauri/custom-protocol
+cargo build --release
 ```
 
 产物位于 `src-tauri/target/release/zcode-pool.exe`。如需一并生成便携版与安装包：

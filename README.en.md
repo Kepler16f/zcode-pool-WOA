@@ -1,14 +1,28 @@
-# Z·POOL
+# Z·POOL (Windows on ARM fork)
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB?logo=tauri&logoColor=white)](https://tauri.app)
-[![Release](https://img.shields.io/github/v/release/Limitinfinitude/zcode-pool?label=release)](../../releases)
+[![Release](https://img.shields.io/github/v/release/Kepler16f/zcode-pool-WOA?label=release)](../../releases)
 
 [简体中文](README.md) ｜ **English**
 
 Z·POOL is a Tauri 2 desktop application that keeps ZCode / Z.ai account identities, an Outlook mailbox pool and
 per-account quotas in one place — and exposes a local proxy with a **web console** so third-party apps such as
 pi-agent or LobeChat can spend the pool's quota directly.
+
+## About this fork
+
+This repo is a fork of [Limitinfinitude/zcode-pool](https://github.com/Limitinfinitude/zcode-pool), named **zcode-pool-WOA** (Windows on ARM).
+All upstream features are kept; three fixes target ARM64 Windows devices (Snapdragon X, Surface Pro 9/11, etc.) and real-world setups:
+
+| Change | The upstream problem | What this fork does |
+| --- | --- | --- |
+| **Native Windows ARM64 support** | CI only produced `*_x64-setup.exe`; ARM64 devices had to run it through x64 emulation | Added an `aarch64-pc-windows-msvc` cross-compile target shipping `*_arm64-setup.exe`; bumped `cc` so MSVC is discovered on ARM64 hosts; the gateway's `x-platform` header now reports the real architecture (unchanged on x64) |
+| **International sign-in fix** | The sign-in proxy only covered the login window; but the `oauth/cli/init` request that decides which login page you get runs in Rust and was **direct**, so a mainland exit IP always received the mainland `authorize_url` (phone-number login only) | The sign-in proxy now covers the whole OAuth flow (authorize init / login window / token exchange); when no explicit proxy is set it follows the Windows system proxy (Internet Settings registry); SOCKS5 proxies are now supported (HTTP only before) |
+| **ZCode install-path fix** | The relay 503s locally when it can't find `resources\glm\zcode.cjs` — the x64 ZCode build installs to `C:\Program Files (x86)\ZCode\` on ARM64 machines, which wasn't probed | Added the `(x86)` path to `client_path_candidates`; account switching benefits the same way |
+
+Local distribution (`npm run dist`) was adapted too: it reads cross-compiled `target/<triple>/release` outputs, detects the
+architecture from the PE header, and suffixes non-x64 portable builds with `_arm64` so they can't be confused with x64 ones.
 
 ## Screenshots
 
@@ -87,6 +101,7 @@ Download the package for your platform from the [Releases](../../releases) page:
 | Platform | File |
 | --- | --- |
 | Windows | `*_x64-setup.exe` |
+| Windows (ARM64) | `*_arm64-setup.exe` |
 | macOS | `*_universal.dmg` |
 | Linux | `*.deb` / `*.AppImage` |
 
@@ -94,13 +109,13 @@ The binaries are not code-signed, so the system may warn about an unknown publis
 
 ### Building from source
 
-Requirements: Node.js 18 or newer, stable Rust, and — on Windows — the GNU toolchain `stable-x86_64-pc-windows-gnu`.
+Requirements: Node.js 18 or newer and stable Rust. On Windows the default MSVC toolchain works for both x64 and ARM64 devices. ARM64 devices additionally need LLVM installed with `clang` on PATH — `ring` compiles its C code with clang on Windows ARM64, and MSVC's cl.exe cannot be used there.
 
 ```powershell
 npm install
 npm run build
 Set-Location src-tauri
-cargo +stable-x86_64-pc-windows-gnu build --release --features tauri/custom-protocol
+cargo build --release
 ```
 
 The binary is written to `src-tauri/target/release/zcode-pool.exe`. To also produce the portable build and the installer:

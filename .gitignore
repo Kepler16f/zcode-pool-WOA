@@ -42,3 +42,6 @@ capture.ps1
 src-tauri/assets/system_prompt.json
 
 __pycache__/
+
+# ZCode 本地工具配置（编辑器侧 ignore，不进仓库）
+.zcodeignore

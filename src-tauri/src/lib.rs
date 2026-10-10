@@ -412,6 +412,7 @@ struct PollCfg {
     token: String,
     expires_at_ms: u128,
     interval_ms: u64,
+    proxy: Option<String>,
 }
 
 static PENDING_OAUTH: Mutex<Option<PendingOAuth>> = Mutex::new(None);
@@ -440,11 +441,19 @@ async fn oauth_begin(
     }
     let assist_mode = driver::normalize_mode(mode.as_deref());
     let auto = batch.unwrap_or(false);
-    let proxy_url: Option<tauri::Url> = match load_settings(&Paths::detect()).auth_proxy() {
-        Some(p) => {
-            let norm = oauth::parse_proxy_url(p)?;
-            Some(norm.parse::<tauri::Url>().map_err(|e| i18n::trf("err.proxy.invalid", &[("e", &e.to_string())]))?)
-        }
+    // 登录链路的代理：设置里的「登录代理」优先，没设置时兜底 Windows 系统代理。
+    // 必须盖到 Rust 侧请求（init / poll / exchange）而不只是登录窗口：
+    // authorize_url 是 oauth/cli/init 按出口 IP 发的，直连拿到的就是国内版登录页。
+    let (proxy_raw, proxy_src) = match load_settings(&Paths::detect()).auth_proxy() {
+        Some(p) => (Some(p.to_string()), "custom"),
+        None => (oauth::system_http_proxy(), "system"),
+    };
+    let proxy_str: Option<String> = match proxy_raw.as_deref() {
+        Some(p) => Some(oauth::parse_proxy_url(p)?),
+        None => None,
+    };
+    let proxy_url: Option<tauri::Url> = match proxy_str.as_deref() {
+        Some(s) => Some(s.parse::<tauri::Url>().map_err(|e| i18n::trf("err.proxy.invalid", &[("e", &e.to_string())]))?),
         None => None,
     };
     *pending_oauth_guard() = None;
@@ -452,10 +461,15 @@ async fn oauth_begin(
         let _ = w.close();
     }
     let flow = uuid::Uuid::new_v4().to_string();
-    flowlog::log(&flow, "begin", &format!("provider={provider} auto={auto} proxy={} client_ver={}", if proxy_url.is_some() { "on" } else { "off" }, quota::zcode_app_version()));
+    let proxy_desc = match (&proxy_str, proxy_src) {
+        (Some(p), "custom") => format!("custom:{p}"),
+        (Some(p), _) => format!("system:{p}"),
+        (None, _) => "off".into(),
+    };
+    flowlog::log(&flow, "begin", &format!("provider={provider} auto={auto} proxy={proxy_desc} client_ver={}", quota::zcode_app_version()));
     let mid = uuid::Uuid::new_v4().to_string();
-    let (p_init, m_init) = (provider.clone(), mid.clone());
-    let init = match tauri::async_runtime::spawn_blocking(move || oauth::init_flow(&p_init, &m_init))
+    let (p_init, m_init, proxy_init) = (provider.clone(), mid.clone(), proxy_str.clone());
+    let init = match tauri::async_runtime::spawn_blocking(move || oauth::init_flow(&p_init, &m_init, proxy_init.as_deref()))
         .await
     {
         Ok(Ok(v)) => v,
@@ -489,6 +503,7 @@ async fn oauth_begin(
         token: init.poll_token.clone(),
         expires_at_ms: init.expires_at_ms,
         interval_ms: init.poll_interval_ms,
+        proxy: proxy_str.clone(),
     };
     *pending_oauth_guard() = Some(PendingOAuth {
         provider: provider.clone(),
@@ -505,7 +520,8 @@ async fn oauth_begin(
     let profile_dir = login_root.join(&flow);
 
     let app2 = app.clone();
-    let (provider2, state2, flow2, mid2) = (provider.clone(), state.clone(), flow.clone(), mid.clone());
+    let (provider2, state2, flow2, mid2, proxy2) =
+        (provider.clone(), state.clone(), flow.clone(), mid.clone(), proxy_str.clone());
     let flow_close = flow.clone();
     let driver_script = driver::bootstrap_script(&json!({
         "mode": assist_mode,
@@ -551,9 +567,10 @@ async fn oauth_begin(
             return true;
         }
         let full = url.to_string();
-        let (app3, p3, s3, f3, m3) = (app2.clone(), provider2.clone(), state2.clone(), flow2.clone(), mid2.clone());
+        let (app3, p3, s3, f3, m3, px3) =
+            (app2.clone(), provider2.clone(), state2.clone(), flow2.clone(), mid2.clone(), proxy2.clone());
         tauri::async_runtime::spawn(async move {
-            finish_oauth(&app3, p3, s3, f3, m3, &full).await;
+            finish_oauth(&app3, p3, s3, f3, m3, px3, &full).await;
         });
         false
     })
@@ -944,12 +961,13 @@ async fn set_auth_proxy(app: AppHandle, on: bool, url: Option<String>) -> Result
     Ok(())
 }
 
-async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: String, mid: String, callback_url: &str) {
+async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: String, mid: String, proxy: Option<String>, callback_url: &str) {
     let result = {
         let provider = provider.clone();
         let state = state.clone();
         let flow = flow.clone();
         let mid = mid.clone();
+        let proxy = proxy.clone();
         let callback_url = callback_url.to_string();
         tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
             {
@@ -977,7 +995,7 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
                 flowlog::log(&flow, "deeplink-state-mismatch", "");
                 return Err(i18n::tr("err.oauth.state"));
             }
-            let exchanged = match oauth::exchange_token(&provider, &code, &state, &mid) {
+            let exchanged = match oauth::exchange_token(&provider, &code, &state, &mid, proxy.as_deref()) {
                 Ok(v) => v,
                 Err(e) => {
                     flowlog::log(&flow, "exchange-fail", &e);
@@ -1175,7 +1193,7 @@ fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, 
                 flowlog::log(&flow, "poll-exit", "flow-done-or-replaced");
                 return;
             }
-            match oauth::poll_flow_once(&cfg.url, &cfg.token, &mid) {
+            match oauth::poll_flow_once(&cfg.url, &cfg.token, &mid, cfg.proxy.as_deref()) {
                 Ok(oauth::PollOutcome::Pending) => {}
                 Ok(oauth::PollOutcome::Ready(data)) => {
                     flowlog::log(&flow, "poll-ready", "");

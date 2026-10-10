@@ -1,6 +1,6 @@
 [package]
 name = "zcode-pool"
-version = "0.2.3"
+version = "0.2.4"
 description = "ZCode 账号池：邮箱库 / 批量注册验证 / 账号切换"
 license = "MIT"
 edition = "2021"
@@ -25,7 +25,7 @@ chrono = "0.4"
 aes-gcm = "0.10"
 base64 = "0.22"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "2", features = ["json", "socks-proxy"] }
 tiny_http = "0.12"
 sys-locale = "0.3"
 
