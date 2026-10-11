@@ -1683,6 +1683,25 @@ fn page(name: &str, embedded: &str) -> String {
     embedded.to_string()
 }
 
+/// CORS 三件套（aZCode 0.6.6 配套）：aZCode 的 WebView 页面（https://appassets.androidplatform.net）
+/// 对本网关发 fetch 是跨源请求，浏览器强制要求响应带 Access-Control-* 才放行——不回的话就是
+/// "浏览器能连（顶级导航不受 CORS 管）、App 连不上（fetch 被拦）"。这里统一造头，各应答口引用；
+/// 预检（OPTIONS）在 handle() 入口本地 204 应答，不打上游。
+fn cors_headers() -> Vec<tiny_http::Header> {
+    let mk = |k: &str, v: &str| tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()).ok();
+    [
+        ("Access-Control-Allow-Origin", "*"),
+        (
+            "Access-Control-Allow-Headers",
+            "x-api-key, authorization, content-type, anthropic-version, anthropic-dangerous-direct-browser-access",
+        ),
+        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+    ]
+    .iter()
+    .filter_map(|(k, v)| mk(k, v))
+    .collect()
+}
+
 fn reply_html(req: tiny_http::Request, body: String) -> Result<(), String> {
     let mk = |k: &str, v: &str| tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()).unwrap();
     let _ = req.respond(tiny_http::Response::new(
@@ -1706,7 +1725,7 @@ fn reply_json(req: tiny_http::Request, code: u16, v: &Value) -> Result<(), Strin
 fn reply_json_hdr(req: tiny_http::Request, code: u16, hdrs: &[(&str, &str)], v: &Value) -> Result<(), String> {
     let body = serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec());
     let mk = |k: &str, val: &str| tiny_http::Header::from_bytes(k.as_bytes(), val.as_bytes()).ok();
-    let mut hs: Vec<tiny_http::Header> = Vec::new();
+    let mut hs: Vec<tiny_http::Header> = cors_headers();
     if let Some(h) = mk("Content-Type", "application/json") {
         hs.push(h);
     }
@@ -2183,8 +2202,11 @@ fn handle_external(
             }),
             path: usage_path.clone(),
         });
-        let resp =
+        let mut resp =
             tiny_http::Response::new(tiny_http::StatusCode(status), hs, reader, None, None);
+        for h in cors_headers() {
+            resp.add_header(h);
+        }
         let _ = slot.take().unwrap().respond(resp);
         return Ok(());
     }
@@ -2210,7 +2232,10 @@ fn handle_external(
         rec.ms = now_ms().saturating_sub(last_at);
         crate::usage::append(&usage_path, &rec);
         let rd: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(head).chain(reader));
-        let resp = tiny_http::Response::new(tiny_http::StatusCode(status), hs, rd, None, None);
+        let mut resp = tiny_http::Response::new(tiny_http::StatusCode(status), hs, rd, None, None);
+        for h in cors_headers() {
+            resp.add_header(h);
+        }
         let _ = slot.take().unwrap().respond(resp);
         crate::flowlog::log("relay", "abnormal-all", &format!("外部 tried={tried} path={path}"));
         return Ok(());
@@ -2271,11 +2296,27 @@ fn hexval(c: u8) -> Option<u8> {
 }
 
 fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
+    // CORS 预检本地应答（aZCode 0.6.6 配套）：预检只需要知道"允许什么"，不打上游、不进鉴权。
+    if *req.method() == tiny_http::Method::Options {
+        let mut resp = tiny_http::Response::from_string("").with_status_code(204);
+        for h in cors_headers() {
+            resp.add_header(h);
+        }
+        resp.add_header(
+            tiny_http::Header::from_bytes(&b"Access-Control-Max-Age"[..], &b"600"[..]).unwrap(),
+        );
+        let _ = req.respond(resp);
+        return Ok(());
+    }
     let paths = Paths::detect();
     let url = req.url().to_string();
     let mut body = Vec::new();
     if req.as_reader().read_to_end(&mut body).is_err() {
-        let _ = req.respond(tiny_http::Response::from_string("bad body").with_status_code(400));
+        let mut resp = tiny_http::Response::from_string("bad body").with_status_code(400);
+        for h in cors_headers() {
+            resp.add_header(h);
+        }
+        let _ = req.respond(resp);
         return Ok(());
     }
 
@@ -2288,29 +2329,34 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
 
     if !from_loopback && gw.inner.lock().unwrap().bind.starts_with("127.") {
         crate::flowlog::log("relay", "bind-deny", &format!("{path} 来自非本机，但当前是「仅本机」模式"));
-        let _ = req.respond(
-            tiny_http::Response::from_string("not found
-").with_status_code(404),
-        );
+        let mut resp = tiny_http::Response::from_string("not found\n").with_status_code(404);
+        for h in cors_headers() {
+            resp.add_header(h);
+        }
+        let _ = req.respond(resp);
         return Ok(());
     }
     if !from_loopback {
         let keys = gw.inner.lock().unwrap().keys.clone();
         if keys.is_empty() {
 
-            let _ = req.respond(
-                tiny_http::Response::from_string("外部访问未启用：没有配置 API Key\n")
-                    .with_status_code(401),
-            );
+            let mut resp = tiny_http::Response::from_string("外部访问未启用：没有配置 API Key\n")
+                .with_status_code(401);
+            for h in cors_headers() {
+                resp.add_header(h);
+            }
+            let _ = req.respond(resp);
             return Ok(());
         }
         let got = auth_token(&req);
         if !keys.iter().any(|k| *k == got) {
             crate::flowlog::log("relay", "auth-deny", &format!("{path} 凭据不对"));
-            let _ = req.respond(
-                tiny_http::Response::from_string("unauthorized：请在 x-api-key 或 Authorization 里带上 API Key\n")
-                    .with_status_code(401),
-            );
+            let mut resp = tiny_http::Response::from_string("unauthorized：请在 x-api-key 或 Authorization 里带上 API Key\n")
+                .with_status_code(401);
+            for h in cors_headers() {
+                resp.add_header(h);
+            }
+            let _ = req.respond(resp);
             return Ok(());
         }
     }

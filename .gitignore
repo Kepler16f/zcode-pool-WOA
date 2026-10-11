@@ -19,6 +19,7 @@ src-tauri/gen/android/tauri.properties
 src-tauri/gen/android/**/build/
 src-tauri/gen/android/.gradle/
 src-tauri/gen/android/app/src/main/assets/index.html
+.ci-keystore/
 
 # Logs
 *.log

@@ -8,7 +8,7 @@ on:
 
 jobs:
   apk:
-    name: build Android APK (arm64 debug)
+    name: build Android APK (arm64 release)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -19,25 +19,56 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Add Android targets
-        run: rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+      - name: Add Android target (arm64 only)
+        run: rustup target add aarch64-linux-android
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # release APK 必须签名才能装。仓库是公开的 → 不放密钥、不设 secrets。
+      # 首次跑用 keytool 生成一个自签 keystore，actions/cache 持久化；之后所有构建
+      # 复用同一把 → 签名稳定，覆盖安装不用卸载。缓存丢了会重新生成（下次覆盖安装需先卸一次）。
+      - name: Restore or create keystore
+        uses: actions/cache@v4
+        id: ks
+        with:
+          path: .ci-keystore
+          key: zpool-keystore-v1
+      - name: Ensure keystore exists
+        run: |
+          mkdir -p .ci-keystore
+          KS=".ci-keystore/zpool-release.jks"
+          if [ ! -f "$KS" ]; then
+            echo "生成新的自签 keystore（首次构建）"
+            keytool -genkeypair -v -keystore "$KS" -keyalg RSA -keysize 2048 \
+              -validity 10950 -alias zpool -storepass zpool2026 -keypass zpool2026 \
+              -dname "CN=zcode-pool, OU=dev, O=zpool, L=local, ST=local, C=CN"
+          else
+            echo "复用缓存中的 keystore（签名保持稳定）"
+          fi
+
       - name: Install npm deps
         run: npm install
 
-      # 只出 arm64（debug 免签名、单架构，CI 快）。产物在
-      # src-tauri/gen/android/app/build/outputs/apk/arm64/debug/*.apk。
-      # ubuntu runner 预装 Android SDK + NDK（$ANDROID_HOME），不再用 setup-android
-      # （它会尝试装 preview 版并卡在许可确认）。手动触发，不挂 release。
-      - name: Build debug APK
-        run: npm run tauri android build -- --apk --debug --target aarch64
+      # 瘦身要点：release 构建（不带 --debug）—— Rust 走 Cargo.toml 的 strip+lto，
+      # 去掉 debug 包 160MB+ 的主因（全量调试符号）。--target aarch64 只编 arm64 原生库
+      # （上次实测产物即纯 arm64-v8a，无需 split-per-abi 再去构建缺 Rust 库的其他 flavor）。
+      - name: Build release APK (arm64)
+        env:
+          ZPOOL_KEYSTORE: ${{ github.workspace }}/.ci-keystore/zpool-release.jks
+          ZPOOL_KEYSTORE_PASSWORD: zpool2026
+          ZPOOL_KEY_ALIAS: zpool
+          ZPOOL_KEY_PASSWORD: zpool2026
+        run: npm run tauri android build -- --apk --target aarch64
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: zcode-pool-android-arm64-debug
+          name: zcode-pool-android-arm64
           path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
