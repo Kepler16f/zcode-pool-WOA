@@ -8,7 +8,17 @@ release/
 # Tauri
 src-tauri/target/
 src-tauri/target-gnu/
-src-tauri/gen/
+# 安卓工程需纳入版本控制：RelayService.kt / MainActivity.kt / AndroidManifest.xml
+# 是手工写的（保活前台服务），CI 直接构建，不再跑 android init 以免覆盖。
+# 注意：git 对被忽略的「目录」无法再 unignore 内部文件，所以这里放行 gen/ 与
+# gen/android/ 两个目录本身，只忽略其余平台产物（apple/windows 的瞬态文件由各自工程自管）。
+src-tauri/gen/*
+!src-tauri/gen/android/
+src-tauri/gen/android/local.properties
+src-tauri/gen/android/tauri.properties
+src-tauri/gen/android/**/build/
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/app/src/main/assets/index.html
 
 # Logs
 *.log

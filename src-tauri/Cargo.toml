@@ -21,11 +21,20 @@ tauri-build = { version = "2", features = [] }
 zcode-pool-core = { path = "core" }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
-tauri-plugin-autostart = "2"
-tauri-plugin-single-instance = "2"
+# 移动端 OAuth：安卓没有子窗口能力，登录页交给系统浏览器（poll 通道负责收尾）。
+tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "v7"] }
+
+# 托盘 / 开机自启 / 单实例只在桌面有意义（安卓没有系统托盘、由前台服务保活、
+# 系统保证单实例）。移动端不引入这三个插件 crate，否则编译期就缺 API。
+# ⚠ 这里必须用 cargo 内建的 target_os 判定：`cfg(desktop)` 是 tauri-build 给源码
+#   设的自定义 cfg，cargo 的 [target.'cfg(...)'.dependencies] 选择器看不到它（会恒为假，
+#   导致桌面也漏链接插件）。源码里仍用 #[cfg(desktop)]，那是有效的。
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [

@@ -49,10 +49,19 @@ pub(crate) fn pick_home(override_home: Option<PathBuf>, userprofile: Option<Path
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 进程级数据目录锚点。安卓上 HOME 不可写、也读不到有意义的路径，
+/// 启动时把号池锚到应用私有数据目录（getFilesDir()）；桌面 / gatewayd 不会设置它，
+/// 行为完全不变。优先级高于 ZCODE_POOL_HOME，便于测试注入。
+static HOME_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_home_override(path: PathBuf) {
+    let _ = HOME_OVERRIDE.set(path);
+}
+
 impl Paths {
     pub fn detect() -> Paths {
         let home = pick_home(
-            std::env::var("ZCODE_POOL_HOME").ok().map(PathBuf::from),
+            HOME_OVERRIDE.get().cloned().or_else(|| std::env::var("ZCODE_POOL_HOME").ok().map(PathBuf::from)),
             std::env::var("USERPROFILE").ok().map(PathBuf::from),
             std::env::var("HOME").ok().map(PathBuf::from),
         );

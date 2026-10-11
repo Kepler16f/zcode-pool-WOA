@@ -5,12 +5,17 @@ use zcode_pool_core::store::*;
 
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
-use tauri::menu::{MenuBuilder, MenuItem};
-use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager};
+#[cfg(desktop)]
+use tauri::menu::{MenuBuilder, MenuItem};
+#[cfg(desktop)]
+use tauri::tray::TrayIconBuilder;
+#[cfg(desktop)]
 use tauri_plugin_autostart::AutoLaunchManager;
 use tauri_plugin_dialog::DialogExt;
 
+// 安卓没有系统托盘，TRAY_ID 仅桌面用到。
+#[cfg(desktop)]
 const TRAY_ID: &str = "main";
 
 
@@ -42,6 +47,7 @@ fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
+#[cfg(desktop)]
 fn tray_menu_inner(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     let paths = Paths::detect();
     let state = match store::get_state(&paths) {
@@ -66,6 +72,7 @@ fn tray_menu_inner(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
     b.build()
 }
 
+#[cfg(desktop)]
 pub fn rebuild_tray(app: &AppHandle) {
     let app2 = app.clone();
     let res = app.run_on_main_thread(move || {
@@ -95,14 +102,27 @@ pub fn rebuild_tray(app: &AppHandle) {
     }
 }
 
+/// 安卓没有系统托盘：账号变化只需要通知前端（emit 走的是 WebView 事件，平台无关）。
+#[cfg(not(desktop))]
+pub fn rebuild_tray(_app: &AppHandle) {}
+
+/// 把窗口带回前台。unminimize 是桌面专属 API，移动端跳过。
+fn restore_window(w: &tauri::WebviewWindow) {
+    let _ = w.show();
+    #[cfg(desktop)]
+    let _ = w.unminimize();
+    let _ = w.set_focus();
+}
+
+// 仅托盘与单实例回调使用（安卓两者都不存在）。
+#[cfg(desktop)]
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
+        restore_window(&w);
     }
 }
 
+#[cfg(desktop)]
 fn run_tray_action(app: AppHandle, action: String) {
     std::thread::spawn(move || {
         let paths = Paths::detect();
@@ -468,6 +488,23 @@ async fn oauth_begin(
         flow: flow.clone(),
     });
 
+    // 移动端（安卓）没有子窗口能力：登录页交给**系统浏览器**。
+    // 拿到令牌靠的是 spawn_poll_loop 轮询（与窗口无关的通道），浏览器里登录完成后
+    // 深链 zcode:// 归不了本 App，但 poll 会在服务端 ready 时收割 —— 流程照样走得通。
+    #[cfg(not(desktop))]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        let url2 = url.clone();
+        app.opener()
+            .open_url(&url2, None::<String>)
+            .map_err(|e| i18n::trf("err.oauth.open_browser", &[("e", &e.to_string())]))?;
+        flowlog::log(&flow, "browser-open", &url2);
+        spawn_poll_loop(app.clone(), provider.clone(), flow.clone(), mid, poll_cfg);
+        return Ok(json!({ "opened": true, "provider": provider, "mode": assist_mode, "browser": true }));
+    }
+
+    #[cfg(desktop)]
+    {
     let login_root = app
         .path()
         .app_local_data_dir()
@@ -556,6 +593,7 @@ async fn oauth_begin(
     }
     spawn_poll_loop(app.clone(), provider.clone(), flow.clone(), mid, poll_cfg);
     Ok(json!({ "opened": true, "provider": provider, "mode": assist_mode }))
+    }
 }
 
 #[tauri::command]
@@ -581,9 +619,7 @@ async fn reg_action(app: AppHandle, action: String) -> Result<(), String> {
         .ok_or_else(|| i18n::tr("err.reg.no_window"))?;
     match action.as_str() {
         "reveal" => {
-            let _ = win.unminimize();
-            let _ = win.show();
-            let _ = win.set_focus();
+            restore_window(&win);
             Ok(())
         }
         "retry" | "confirm-authorize" | "open-signup" => {
@@ -1200,7 +1236,15 @@ fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, 
     });
 }
 
+#[cfg_attr(not(desktop), allow(unreachable_code))]
 fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
+    // 移动端没有子窗口；领套餐的滑块验证必须在桌面端完成（Web 控制台的 claim-start
+    // 在无头/移动形态已被降级拦截，这里再兜一层，防桌面外的直接调用）。
+    #[cfg(not(desktop))]
+    {
+        let _ = (app, auto);
+        return Err(i18n::tr("err.claim.needs_desktop"));
+    }
     let (w, h) = (380.0, 320.0);
     if let Some(win) = app.get_webview_window("captcha") {
         let _ = win.eval("location.reload()");
@@ -1214,8 +1258,8 @@ fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows";
-    let win = tauri::WebviewWindowBuilder::new(
+    #[cfg_attr(not(desktop), allow(unused_mut))]
+    let mut builder = tauri::WebviewWindowBuilder::new(
         app,
         "captcha",
         tauri::WebviewUrl::App("captcha.html".into()),
@@ -1224,17 +1268,24 @@ fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
     .theme(Some(tauri::Theme::Dark))
     .background_color(tauri::window::Color(0, 0, 0, 255))
     .inner_size(w, h)
-    .min_inner_size(340.0, 280.0)
-    .maximizable(false)
     .resizable(false)
-    .additional_browser_args(BROWSER_ARGS)
-    .visible(false)
-    .build()
-    .map_err(|e| {
-        flowlog::log("captcha", "build-err", &e.to_string());
-        e.to_string()
-    })?;
+    .visible(false);
+    // maximizable / 附加浏览器参数是 WebView2 桌面概念，移动端没有。
+    #[cfg(desktop)]
+    {
+        builder = builder.maximizable(false);
+        const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows";
+        builder = builder.additional_browser_args(BROWSER_ARGS);
+    }
+    let win = builder
+        .build()
+        .map_err(|e| {
+            flowlog::log("captcha", "build-err", &e.to_string());
+            e.to_string()
+        })?;
+    #[cfg(desktop)]
     center_over_main(app, &win, w, h);
+    let _ = h;
     if !auto {
         let _ = win.show();
         let _ = win.set_focus();
@@ -1325,12 +1376,14 @@ fn center_over_main(app: &AppHandle, win: &tauri::WebviewWindow, w: f64, h: f64)
 }
 
 #[tauri::command]
+#[cfg(desktop)]
 async fn autostart_status(app: AppHandle) -> Result<bool, String> {
     let al = app.state::<AutoLaunchManager>();
     al.is_enabled().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
+#[cfg(desktop)]
 async fn autostart_set(app: AppHandle, enable: bool) -> Result<bool, String> {
     let al = app.state::<AutoLaunchManager>();
     if enable {
@@ -1339,6 +1392,19 @@ async fn autostart_set(app: AppHandle, enable: bool) -> Result<bool, String> {
         al.disable().map_err(|e| e.to_string())?;
     }
     al.is_enabled().map_err(|e| e.to_string())
+}
+
+/// 移动端没有开机自启插件（安卓用前台服务保活），命令保留但恒报不支持，前端据此隐藏开关。
+#[tauri::command]
+#[cfg(not(desktop))]
+async fn autostart_status(_app: AppHandle) -> Result<bool, String> {
+    Err(i18n::tr("err.autostart.unsupported"))
+}
+
+#[tauri::command]
+#[cfg(not(desktop))]
+async fn autostart_set(_app: AppHandle, _enable: bool) -> Result<bool, String> {
+    Err(i18n::tr("err.autostart.unsupported"))
 }
 
 #[tauri::command]
@@ -1492,8 +1558,6 @@ async fn open_external(url: String) -> Result<(), String> {
     store::open_url(&url)
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-
 fn relay() -> &'static gateway::Gateway {
     gateway::relay()
 }
@@ -1532,16 +1596,26 @@ async fn relay_external(on: bool) -> Result<Value, String> {
     relay().set_external_and_run(&Paths::detect(), on)
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_main(app);
-        }))
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
+        .plugin(tauri_plugin_opener::init());
+
+    // 单实例守卫只在桌面有意义：安卓由系统保证 Activity 单例。
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        show_main(app);
+    }));
+
+    // 开机自启是桌面概念（安卓用前台服务保活）。
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_autostart::init(
+        tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+        None,
+    ));
+
+    builder
         .invoke_handler(tauri::generate_handler![
             get_state,
             app_version,
@@ -1612,10 +1686,21 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // 安卓进程里 HOME 不可写：把号池锚到应用私有目录（getFilesDir），
+            // 必须在任何 Paths::detect() 之前设置。
+            #[cfg(not(desktop))]
+            if let Ok(dir) = app.path().app_data_dir() {
+                store::set_home_override(dir);
+            }
+
             i18n::init_from_settings(&store::load_settings(&Paths::detect()));
+            #[cfg(desktop)]
             if let Ok(data_dir) = app.path().app_local_data_dir() {
                 flowlog::init(&data_dir);
             }
+            // 移动端日志跟着号池走（.zcode-pool/logs/oauth.log），adb 也方便翻。
+            #[cfg(not(desktop))]
+            flowlog::init(&Paths::detect().store_dir());
 
             let paths = Paths::detect();
 
@@ -1639,7 +1724,12 @@ pub fn run() {
             // ⚠ 设置**只读一次**。以前这里读两遍（先判断开关、再取端口），
             //   两次之间文件若被原子替换，第二遍会读失败 → 回默认值 → 端口悄悄变 8899。
             let st0 = store::load_settings(&paths);
-            if st0.relay_external == Some(true) {
+            // 桌面保持显式开关；移动端的意义就是当常驻反代，只要没明确关过就默认起。
+            #[cfg(desktop)]
+            let want_relay = st0.relay_external == Some(true);
+            #[cfg(not(desktop))]
+            let want_relay = st0.relay_external != Some(false);
+            if want_relay {
 
                 let want_port = st0
                     .relay_port
@@ -1649,25 +1739,29 @@ pub fn run() {
                     Err(e) => zcode_pool_core::flowlog::log("relay", "start-fail", &e),
                 }
             }
-            let _tray = TrayIconBuilder::with_id(TRAY_ID)
-                .icon(app.default_window_icon().expect("no window icon").clone())
-                .tooltip("Z·POOL")
-                .menu(&tray_menu_inner(app.handle())?)
-                .show_menu_on_left_click(false)
-                .on_menu_event(move |app, event| {
-                    let id = event.id().as_ref().to_string();
-                    match id.as_str() {
-                        "show" => show_main(app),
-                        "quit" => app.exit(0),
-                        other => run_tray_action(app.clone(), other.to_string()),
-                    }
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. } = event {
-                        show_main(tray.app_handle());
-                    }
-                })
-                .build(app)?;
+            // 安卓没有系统托盘；移动端靠前台服务通知保活（见 gen/android Kotlin 侧）。
+            #[cfg(desktop)]
+            {
+                let _tray = TrayIconBuilder::with_id(TRAY_ID)
+                    .icon(app.default_window_icon().expect("no window icon").clone())
+                    .tooltip("Z·POOL")
+                    .menu(&tray_menu_inner(app.handle())?)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(move |app, event| {
+                        let id = event.id().as_ref().to_string();
+                        match id.as_str() {
+                            "show" => show_main(app),
+                            "quit" => app.exit(0),
+                            other => run_tray_action(app.clone(), other.to_string()),
+                        }
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. } = event {
+                            show_main(tray.app_handle());
+                        }
+                    })
+                    .build(app)?;
+            }
 
             Ok(())
         })
