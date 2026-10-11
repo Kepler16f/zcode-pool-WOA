@@ -294,8 +294,20 @@ fn claim_start_inner(
         config: acc.config,
         device_mid: mid,
     });
-    open_captcha_window(app, auto)?;
-    Ok(json!({ "account": acc.name, "plan": display, "captcha": true }))
+    // 桌面：弹独立验证码子窗（滑块被拦时用户滑一下，无感验证时后台静默完成）。
+    // 移动端：Tauri 开不了子窗 —— 返回 inline 标记，主窗口把 captcha.html 铺成
+    // 同源 iframe 覆盖层，postMessage 桥接；param 到手后走的 claim_captcha_submit
+    // 是纯 Rust HTTP，与平台无关。pending 已在上面入库存好，iframe 只管拿 param。
+    #[cfg(desktop)]
+    {
+        open_captcha_window(app, auto)?;
+        return Ok(json!({ "account": acc.name, "plan": display, "captcha": true }));
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (app, auto);
+        Ok(json!({ "account": acc.name, "plan": display, "inline": true }))
+    }
 }
 
 pub fn emit_state_changed(app: &AppHandle) {
@@ -1704,20 +1716,27 @@ pub fn run() {
 
             let paths = Paths::detect();
 
-            // 把桌面钩子注入核心：账号变化同步托盘/前端；Web 控制台领取套餐时弹验证码窗口。
-            // 无头形态（gatewayd/安卓）不注入这些，Web 端点自动降级为明确提示。
+            // 注入宿主钩子。桌面：on_change 同步托盘+前端，claim_start 让 Web 控制台
+            // 领取时弹验证码子窗。移动端：只注 on_change（同步前端），claim_start 留空 ——
+            // App 内联领取走 claim_start 命令 + iframe 覆盖层，Web 控制台的领取无子窗可弹，
+            // 由 claim-start 端点降级提示（见 gateway.rs）。
             {
                 let app2 = app.handle().clone();
-                let app3 = app.handle().clone();
-                relay().set_hooks(
-                    Arc::new(move || {
-                        rebuild_tray(&app2);
-                        emit_state_changed(&app2);
-                    }),
-                    Arc::new(move |id: &str, plan_id: &str, auto: bool| {
+                let on_change: Option<Arc<dyn Fn() + Send + Sync>> = Some(Arc::new(move || {
+                    #[cfg(desktop)]
+                    rebuild_tray(&app2);
+                    emit_state_changed(&app2);
+                }));
+                #[cfg(desktop)]
+                let claim_hook: Option<Arc<dyn Fn(&str, &str, bool) -> Result<Value, String> + Send + Sync>> = {
+                    let app3 = app.handle().clone();
+                    Some(Arc::new(move |id: &str, plan_id: &str, auto: bool| {
                         proxy_claim_start(&app3, id.to_string(), plan_id.to_string(), auto)
-                    }),
-                );
+                    }))
+                };
+                #[cfg(not(desktop))]
+                let claim_hook: Option<Arc<dyn Fn(&str, &str, bool) -> Result<Value, String> + Send + Sync>> = None;
+                relay().set_hooks(on_change, claim_hook);
             }
 
             relay().restore_persisted(&paths);

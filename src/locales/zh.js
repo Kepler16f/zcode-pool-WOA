@@ -421,4 +421,6 @@ export const zh = {
   "c.initFail": "验证码初始化失败",
   "c.inPopup": "请在弹窗中完成验证…",
   "c.cspBlocked": "CSP 拦截 {directive} ← {uri}",
+  "c.inlineClose": "取消领取",
+  "c.inlineWaiting": "安全验证进行中…",
 };

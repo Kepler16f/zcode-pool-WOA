@@ -1,6 +1,42 @@
-import { invoke } from "@tauri-apps/api/core";
-import { emit } from "@tauri-apps/api/event";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { emit as tauriEmit } from "@tauri-apps/api/event";
 import { init, t, lang, stripErr } from "./i18n.js";
+
+// ── 移动端内联模式（安卓/iOS）─────────────────────────────────────
+// Tauri 移动端开不了子窗口：主窗口把本页铺成同源 iframe 覆盖层（?bridge=1），
+// iframe 里 Tauri IPC 不可靠（不保证被注入），于是 invoke/emit 换成与父窗口的
+// postMessage RPC —— 父窗口代跑命令、回投结果，并负责显示/收起/取消覆盖层。
+// 桌面独立窗口路径不满足 BRIDGE，行为与从前完全一致。
+const BRIDGE = (() => {
+  try { return window.parent !== window && new URLSearchParams(location.search).has("bridge"); }
+  catch { return false; }
+})();
+
+const rpcMap = new Map();
+let rpcSeq = 0;
+function bridgeInvoke(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const id = String(++rpcSeq);
+    rpcMap.set(id, { resolve, reject });
+    window.parent.postMessage({ t: "zpool-cap", k: "invoke", id, cmd, args: args || {} }, "*");
+  });
+}
+if (BRIDGE) {
+  window.addEventListener("message", (ev) => {
+    const d = ev.data;
+    if (!d || d.t !== "zpool-cap" || d.k !== "reply") return;
+    const p = rpcMap.get(d.id);
+    if (!p) return;
+    rpcMap.delete(d.id);
+    if (d.ok) p.resolve(d.data);
+    else p.reject(new Error(d.err || "bridge error"));
+  });
+}
+const invoke = BRIDGE ? bridgeInvoke : tauriInvoke;
+// 桌面：tauri 事件；桥：父窗口收到后显示覆盖层（自动轮则由父窗口取消当轮）。
+const emit = BRIDGE
+  ? async (name) => { window.parent.postMessage({ t: "zpool-cap", k: "interactive", name }, "*"); }
+  : tauriEmit;
 
 const SDK_URL = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
 const TRACELESS_TIMEOUT = 8000;

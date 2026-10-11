@@ -421,4 +421,6 @@ export const en = {
   "c.initFail": "Captcha initialization failed",
   "c.inPopup": "Complete verification in the popup…",
   "c.cspBlocked": "CSP blocked {directive} ← {uri}",
+  "c.inlineClose": "Cancel claim",
+  "c.inlineWaiting": "Security check in progress…",
 };

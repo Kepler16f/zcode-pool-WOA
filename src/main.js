@@ -4,6 +4,7 @@ import { esc, toast, openConfirmModal, openAddAccountModal, installDelegation } 
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
 import { regActive, regStart, regClose, regEvent, setRegSkip } from "./reg.js";
+import { open as openInlineCaptcha, close as closeInlineCaptcha } from "./inlinecap.js";
 import {
   setMboxRerender, mboxLoad, mboxPage, mboxFilter, mboxToggle, mboxImport,
   mboxRemove, mboxDelete, mboxSelection, mboxVerify, mboxStop, mboxOnOauthDone, mboxRunning, mboxCurrent, mboxStats,
@@ -131,10 +132,36 @@ let claimWaiter = null;
 function waitForClaimResult(accountId, timeoutMs = 90000) {
   return new Promise((resolve) => {
     let done = false;
-    const finish = (v) => { if (!done) { done = true; claimWaiter = null; clearTimeout(t); resolve(v); } };
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      claimWaiter = null;
+      clearTimeout(t);
+      closeInlineCaptcha(); // 桌面从未开覆盖层 → 空操作；移动端无论成败/超时都收起
+      resolve(v);
+    };
     const t = setTimeout(() => finish(null), timeoutMs);
     claimWaiter = { accountId, finish };
   });
+}
+
+// 领取套餐统一入口：claim_start → 移动端（返回 inline:true）铺内联验证码覆盖层。
+// opts.onInteractive：无感被拦时的回调（自动轮次传 onCaptchaInteractive，对齐桌面
+// captcha://interactive 的处理：取消当轮 + cooldown；手动领取不传，覆盖层浮出等用户滑完）。
+async function beginClaim(args, opts) {
+  const res = await invoke("claim_start", args);
+  if (res && res.inline) {
+    openInlineCaptcha({
+      auto: args.auto === true,
+      onInteractive: opts && opts.onInteractive,
+      onCancel: async () => {
+        await invoke("claim_cancel").catch(() => {});
+        // 用户主动取消不算失败：带 accountId 让后续刷新定位到号，带 silent 让 result 监听跳过报错 toast。
+        if (claimWaiter) claimWaiter.finish({ ok: false, code: "canceled", accountId: args.id, silent: true });
+      },
+    });
+  }
+  return res;
 }
 
 async function awaitClaimPreviewFresh(id) {
@@ -544,7 +571,7 @@ const actions = {
     if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
     claimActive = true;
     try {
-      await invoke("claim_start", { id, planId: plan.plan_id });
+      await beginClaim({ id, planId: plan.plan_id });
       toast(t("m.claimVerify", { name: plan.name || plan.plan_id }), "ok", t("m.claimVerifyDetail"));
       const r = await waitForClaimResult(id);
       if (!r) toast(t("m.claimTimeout"), "warn");
@@ -569,7 +596,7 @@ const actions = {
         const plan = claimable[id].plans[0];
         const name = state.accounts.find((a) => a.id === id)?.name || id;
         try {
-          await invoke("claim_start", { id, planId: plan.plan_id });
+          await beginClaim({ id, planId: plan.plan_id });
         } catch (e) {
           toast(t("m.claimAccountErr", { name, err: stripErr(e) }), "err");
           continue;
@@ -727,7 +754,10 @@ async function autoClaimTick() {
         const plan = claimable[id]?.plans?.[0];
         if (!plan) break;
         try {
-          await invoke("claim_start", { id, planId: plan.plan_id, auto: true });
+          await beginClaim(
+            { id, planId: plan.plan_id, auto: true },
+            { onInteractive: () => onCaptchaInteractive(id) },
+          );
         } catch (e) {
           await invoke("claim_cancel").catch(() => {});
           autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
@@ -1464,11 +1494,13 @@ listen("claim://result", (ev) => {
   const p = ev.payload || {};
   if (claimWaiter && claimWaiter.accountId === p.accountId) claimWaiter.finish(p);
   if (p.ok === false) {
-    let msg = p.message || t("m.unknownErr");
-    if (p.code === 1005 && p.nextAt) {
-      msg += t("m.claimNextAt", { time: new Date(p.nextAt).toLocaleString(localeTag(), { hour12: false }) });
+    if (!p.silent) {
+      let msg = p.message || t("m.unknownErr");
+      if (p.code === 1005 && p.nextAt) {
+        msg += t("m.claimNextAt", { time: new Date(p.nextAt).toLocaleString(localeTag(), { hour12: false }) });
+      }
+      toast(t("m.claimFailed", { name: p.accountName, msg }), "err");
     }
-    toast(t("m.claimFailed", { name: p.accountName, msg }), "err");
   } else {
     const bits = [];
     const now = p.serverTime || Date.now();
@@ -1485,13 +1517,20 @@ listen("claim://result", (ev) => {
   }
 });
 
-listen("captcha://interactive", () => {
+// 无感验证被风控拦（桌面 captcha://interactive 事件 / 移动端 iframe 桥回调共用）。
+// 自动轮次：取消当轮 + 冷却 1h（对齐桌面：轮次不在无人值守时要求人工滑）；
+// 手动领取时覆盖层保持浮出，用户在 iframe 里滑完即可（不走这里）。
+function onCaptchaInteractive(id) {
   if (!autoClaimRunning || !claimWaiter) return;
-  const id = claimWaiter.accountId;
   invoke("claim_cancel").catch(() => {});
   autoClaimCooldown[id] = Date.now() + 60 * 60 * 1000;
   toast(t("m.autoClaimInteractive", { name: accountName(id) }), "warn", t("m.autoClaimInteractiveDetail"));
   claimWaiter.finish({ ok: false, code: "interactive" });
+}
+
+listen("captcha://interactive", () => {
+  if (!autoClaimRunning || !claimWaiter) return;
+  onCaptchaInteractive(claimWaiter.accountId);
 });
 
 listen("oauth://done", (ev) => {

@@ -303,16 +303,18 @@ impl Gateway {
         g
     }
 
-    /// 桌面壳注入钩子：on_change = 账号/状态变化后同步托盘与前端；
-    /// claim_start = Web 控制台发起「领取套餐」时在桌面侧弹出验证码窗口。
+    /// 宿主注入钩子（均可缺省）：
+    /// - on_change：账号/状态变化后同步托盘与前端（无头形态不注入）
+    /// - claim_start：Web 控制台发起「领取套餐」时由宿主弹验证码窗口。只有桌面能弹子窗；
+    ///   移动端 App 的领取走主窗内联覆盖层（claim_start 命令），Web 控制台在移动端不注入此钩子。
     pub fn set_hooks(
         &self,
-        on_change: Arc<dyn Fn() + Send + Sync>,
-        claim_start: Arc<dyn Fn(&str, &str, bool) -> Result<Value, String> + Send + Sync>,
+        on_change: Option<Arc<dyn Fn() + Send + Sync>>,
+        claim_start: Option<Arc<dyn Fn(&str, &str, bool) -> Result<Value, String> + Send + Sync>>,
     ) {
         let mut h = self.hooks.lock().unwrap();
-        h.on_change = Some(on_change);
-        h.claim_start = Some(claim_start);
+        h.on_change = on_change;
+        h.claim_start = claim_start;
     }
 
     fn sync_exe(&self) {
