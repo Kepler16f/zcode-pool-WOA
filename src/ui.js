@@ -14,6 +14,61 @@ export function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// ── 平台探测与移动端文件选择 ─────────────────────────────────────────
+// tauri-plugin-dialog 的 pick/save 只在桌面有实现；安卓点了没反应。
+// 移动端改用 WebView 的 <input type=file>（wry 的 WebChromeClient 已接系统选择器），
+// 读出文本后交给按内容入库的命令（pool_import_content / import_content）。
+let _platform = null;
+export async function platform() {
+  if (!_platform) { try { _platform = await invoke("get_platform"); } catch { _platform = "windows"; } }
+  return _platform;
+}
+export async function isMobile() {
+  const p = await platform();
+  return p === "android" || p === "ios";
+}
+
+// FileReader 而非 Blob.text()：minSdk 24 的老 WebView 不一定有后者的 Promise 形态。
+function readFileText(f) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result ?? ""));
+    r.onerror = () => reject(r.error);
+    r.readAsText(f);
+  });
+}
+
+// 单例 file input：用户取消时 change 不触发，把上一次的等待以空数组结掉，防悬挂。
+let _pickResolve = null;
+export function pickFilesAsText(accept, multiple) {
+  return new Promise((resolve) => {
+    if (_pickResolve) _pickResolve([]); // 上一次（被取消的）选择作废
+    let inp = document.getElementById("native-file-pick");
+    if (!inp) {
+      inp = document.createElement("input");
+      inp.id = "native-file-pick";
+      inp.type = "file";
+      inp.style.display = "none";
+      document.body.appendChild(inp);
+      inp.onchange = async () => {
+        const r = _pickResolve;
+        _pickResolve = null;
+        const files = Array.from(inp.files || []);
+        const out = [];
+        for (const f of files) {
+          try { out.push({ name: f.name, text: await readFileText(f) }); } catch { /* 读不到的跳过 */ }
+        }
+        inp.value = "";
+        if (r) r(out);
+      };
+    }
+    inp.accept = accept || "";
+    inp.multiple = !!multiple;
+    _pickResolve = resolve;
+    inp.click();
+  });
+}
+
 export function toast(msg, kind = "ok", detail = "") {
   let zone = document.querySelector(".toasts");
   if (!zone) {

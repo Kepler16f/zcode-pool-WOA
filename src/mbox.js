@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { t } from "./i18n.js";
 import { ic } from "./icons.js";
-import { esc, toast, openLineModal } from "./ui.js";
+import { esc, toast, openLineModal, isMobile, pickFilesAsText } from "./ui.js";
 import { regStart, regBatchSet } from "./reg.js";
 
 let rerender = () => {};
@@ -190,7 +190,16 @@ export function mboxToggleRow(email) {
 
 export async function mboxImport() {
   try {
-    const r = await invoke("pool_import_pick");
+    // 安卓/桌面分路：移动端用系统文件选择器（WebView input[type=file]）读文本，
+    // 走 pool_import_content 按内容入库；桌面保持原生对话框。
+    let r;
+    if (await isMobile()) {
+      const files = await pickFilesAsText("text/plain,.txt", false);
+      if (!files.length) return;
+      r = await invoke("pool_import_content", { text: files[0].text });
+    } else {
+      r = await invoke("pool_import_pick");
+    }
     if (!r || !r.picked) return;
     await mboxLoad();
     rerender();

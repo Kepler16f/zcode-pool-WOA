@@ -166,6 +166,14 @@ fn app_version(app: AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
+/// 前端据此分支导入/导出：桌面用原生文件对话框（tauri-plugin-dialog），
+/// 移动端（安卓）该插件的 pick/save 没有实现（点了没反应），改走 WebView 的
+/// `<input type=file>`（wry 的 WebChromeClient 接系统选择器）按内容读写。
+#[tauri::command]
+fn get_platform() -> &'static str {
+    std::env::consts::OS
+}
+
 #[tauri::command]
 async fn capture_current(app: AppHandle, name: Option<String>) -> Result<Account, String> {
     let _guard = store_guard();
@@ -1502,6 +1510,57 @@ async fn import_files(app: AppHandle) -> Result<ImportReport, String> {
     Ok(report)
 }
 
+/// 邮箱池导入（移动端路径）：`pool_import_pick` 用的是桌面文件对话框（安卓上点了没反应），
+/// 安卓改用 WebView 原生 `<input type=file>` 选好后把文本传进来，这里按内容入库。
+#[tauri::command]
+async fn pool_import_content(app: AppHandle, text: String) -> Result<Value, String> {
+    let _guard = store_guard();
+    let root = Paths::detect().store_dir();
+    let mut accounts = pool::load(&root);
+    let r = pool::import(&mut accounts, &text, store::now_ts());
+    pool::save(&root, &accounts)?;
+    drop(_guard);
+    rebuild_tray(&app);
+    let items: Vec<_> = accounts.iter().map(|a| a.to_summary()).collect();
+    Ok(json!({
+        "picked": true,
+        "added": r.added,
+        "skipped": r.skipped,
+        "parsed": r.total_parsed,
+        "accounts": items,
+    }))
+}
+
+/// 账号导入（移动端路径）：前端把选中的 JSON 文件逐个读成文本传进来，
+/// 与 import_files 同样的解析 / 合并 / 错误收集，只是来源是内存而非桌面文件对话框。
+#[derive(serde::Deserialize)]
+struct ImportEntry {
+    name: String,
+    text: String,
+}
+
+#[tauri::command]
+async fn import_content(app: AppHandle, files: Vec<ImportEntry>) -> Result<ImportReport, String> {
+    let _guard = store_guard();
+    let mut bundles = vec![];
+    let mut errors = vec![];
+    for f in files {
+        match serde_json::from_str::<Value>(&f.text) {
+            Ok(v) => bundles.push((f.name, v)),
+            Err(e) => errors.push(i18n::trf("err.import.json", &[("fname", f.name.as_str()), ("e", &e.to_string())])),
+        }
+    }
+    let mut report = if bundles.is_empty() {
+        ImportReport { picked: true, ..Default::default() }
+    } else {
+        import_values(&Paths::detect(), &bundles)?
+    };
+    report.picked = true;
+    report.errors.extend(errors);
+    rebuild_tray(&app);
+    Ok(report)
+}
+
 #[tauri::command]
 async fn pool_export(app: AppHandle) -> Result<serde_json::Value, String> {
     let root = Paths::detect().store_dir();
@@ -1631,6 +1690,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             app_version,
+            get_platform,
             capture_current,
             rename_account,
             delete_account,
@@ -1654,6 +1714,7 @@ pub fn run() {
             reg_fetch_link,
             pool_list,
             pool_import_pick,
+            pool_import_content,
             pool_remove,
             pool_remove_many,
             pool_get,
@@ -1671,6 +1732,7 @@ pub fn run() {
             export_one,
             export_all,
             import_files,
+            import_content,
             pool_export,
             pick_zcode_path,
             set_zcode_path,

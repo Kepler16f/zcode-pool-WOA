@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { esc, toast, openConfirmModal, openAddAccountModal, installDelegation } from "./ui.js";
+import { esc, toast, openConfirmModal, openAddAccountModal, installDelegation, isMobile, pickFilesAsText } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
 import { regActive, regStart, regClose, regEvent, setRegSkip } from "./reg.js";
@@ -461,7 +461,15 @@ const actions = {
   },
   async importFiles() {
     try {
-      const report = await invoke("import_files");
+      // 移动端：系统文件选择器多选 JSON → 读文本走 import_content；桌面保持原生对话框
+      let report;
+      if (await isMobile()) {
+        const files = await pickFilesAsText("application/json,.json", true);
+        if (!files.length) return;
+        report = await invoke("import_content", { files });
+      } else {
+        report = await invoke("import_files");
+      }
       if (!report.picked) return;
       actions.finishImport(report);
     } catch (e) { toast(stripErr(e), "err"); }
