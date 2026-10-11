@@ -22,19 +22,18 @@ jobs:
       - name: Add Android targets
         run: rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
 
-      - uses: android-actions/setup-android@v3
-
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
       - name: Install npm deps
         run: npm install
 
-      # 只出 arm64（用户手机都是 Snapdragon/苹果外的安卓，全 arm64）：debug 免签名、
-      # 单架构，CI 快很多。产物是 app/build/outputs/apk/arm64/debug/*.apk。
-      # 用 workflow_dispatch 手动触发，不挂 release、不发草稿。
+      # 只出 arm64（debug 免签名、单架构，CI 快）。产物在
+      # src-tauri/gen/android/app/build/outputs/apk/arm64/debug/*.apk。
+      # ubuntu runner 预装 Android SDK + NDK（$ANDROID_HOME），不再用 setup-android
+      # （它会尝试装 preview 版并卡在许可确认）。手动触发，不挂 release。
       - name: Build debug APK
-        run: npm run tauri android build -- --apk --debug --target-android aarch64
+        run: npm run tauri android build -- --apk --debug --target aarch64
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
