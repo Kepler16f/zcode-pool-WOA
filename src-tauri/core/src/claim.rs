@@ -131,7 +131,7 @@ pub const ACTIVATION_EVENTS: [&str; 3] = ["app_launch", "app_daily_active", "app
 const SCREEN_RESOLUTION: &str = "2560x1440";
 const ACTIVATION_TIMEOUT_SECS: u64 = 10;
 
-pub(crate) fn telemetry_user_id(home: &Path, creds: &Value) -> Option<String> {
+pub fn telemetry_user_id(home: &Path, creds: &Value) -> Option<String> {
     let secret = zcrypto::default_secret(home);
     let provider = creds
         .get("oauth:active_provider")
@@ -462,4 +462,30 @@ pub fn failure_message(code: i64, body: &Value) -> String {
     } else {
         crate::i18n::trf("claim.fail.with_server", &[("base", &base), ("server_msg", &server_msg)])
     }
+}
+
+/// 最近一次「领取套餐」的结果快照（Web 控制台轮询展示用）。
+/// 原先在 tauri 壳里，随核心下移后桌面与无头形态共用。
+static LAST_CLAIM: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+
+fn last_claim_guard() -> std::sync::MutexGuard<'static, Option<Value>> {
+    match LAST_CLAIM.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+pub fn last_result() -> Value {
+    last_claim_guard().clone().unwrap_or(Value::Null)
+}
+
+pub fn record_result(payload: &Value) {
+    // ⚠ `at` 是给人看的字符串；前端要**比时间先后**，字符串比不了 ——
+    //   它和 unix 秒数相减会得到 NaN，判断恒为 false，成功分支就永远进不去
+    //   （症状：领取成功了却一直显示「正在领取中」然后超时）。所以另给一个数值 `atMs`。
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    *last_claim_guard() = Some(serde_json::json!({ "at": crate::store::now_ts(), "atMs": ms, "result": payload }));
 }

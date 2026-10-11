@@ -1,0 +1,7 @@
+# gatewayd 安卓/Linux 交叉编译（aarch64 musl，静态自包含）：
+# - 链接器用 rust-lld（rustup 自带，不需要 NDK/GCC）
+# - C 代码（ring）用宿主 LLVM 的 clang 以 musl 目标编译
+# - crt 对象从 rust-std 自包含组件取（musl target 自带）
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+runner = "qemu-aarch64"

@@ -5361,6 +5361,22 @@ dependencies = [
 name = "zcode-pool"
 version = "0.2.3"
 dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-autostart",
+ "tauri-plugin-dialog",
+ "tauri-plugin-single-instance",
+ "uuid",
+ "windows-sys 0.52.0",
+ "zcode-pool-core",
+]
+
+[[package]]
+name = "zcode-pool-core"
+version = "0.2.3"
+dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "chrono",
@@ -5370,13 +5386,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "sys-locale",
- "tauri",
- "tauri-build",
- "tauri-plugin-autostart",
- "tauri-plugin-dialog",
- "tauri-plugin-single-instance",
  "tiny_http",
  "ureq",
+ "url",
  "uuid",
  "windows-sys 0.52.0",
 ]

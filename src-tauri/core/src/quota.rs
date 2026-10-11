@@ -171,7 +171,7 @@ fn version_from_install() -> Option<String> {
     }
 }
 
-pub(crate) fn zcode_app_version() -> String {
+pub fn zcode_app_version() -> String {
     static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {

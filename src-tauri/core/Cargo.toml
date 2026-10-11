@@ -1,0 +1,39 @@
+[package]
+name = "zcode-pool-core"
+version = "0.2.3"
+edition = "2021"
+license = "MIT"
+description = "Z·POOL 业务核心：反代网关 / 号池存储 / OAuth / 额度查询（平台无关，无 GUI 依赖）"
+
+[lib]
+name = "zcode_pool_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gatewayd"
+path = "src/bin/gatewayd.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "v7"] }
+chrono = "0.4"
+aes-gcm = "0.10"
+base64 = "0.22"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+ureq = { version = "2", features = ["json", "socks-proxy"] }
+tiny_http = "0.12"
+sys-locale = "0.3"
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+iana-time-zone = "0.1"

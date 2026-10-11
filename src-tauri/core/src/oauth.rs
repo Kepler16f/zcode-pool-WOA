@@ -90,7 +90,7 @@ fn init_flow_at(url: &str, provider: &str, mid: &str, proxy: Option<&str>) -> Re
     let poll_interval_ms = data.get("poll_interval_sec").and_then(|x| x.as_f64()).map(|s| (s * 1000.0) as u64)
         .ok_or_else(invalid)?;
 
-    let auth_url: tauri::Url = authorize.parse().map_err(|_| invalid())?;
+    let auth_url: url::Url = authorize.parse().map_err(|_| invalid())?;
     let state = auth_url
         .query_pairs()
         .find(|(k, _)| k == "state")
@@ -108,7 +108,7 @@ fn init_flow_at(url: &str, provider: &str, mid: &str, proxy: Option<&str>) -> Re
         return Err(invalid());
     }
     let init_base: String = url
-        .parse::<tauri::Url>()
+        .parse::<url::Url>()
         .map(|u| u.origin().ascii_serialization())
         .map_err(|_| invalid())?;
     Ok(FlowInit {
@@ -495,7 +495,7 @@ fn no_window(prog: &str) -> std::process::Command {
 /// 仅在「登录代理」未显式设置时兜底：用户开了系统代理却没在应用里填，登录照样该走代理。
 /// ProxyServer 两种格式都处理：`host:port`（全局 http 代理）与 `http=h:p;https=h:p;socks=h:p`（按协议）。
 #[cfg(windows)]
-pub(crate) fn system_http_proxy() -> Option<String> {
+pub fn system_http_proxy() -> Option<String> {
     let out = no_window("reg")
         .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"])
         .output()
@@ -531,7 +531,7 @@ pub(crate) fn system_http_proxy() -> Option<String> {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn system_http_proxy() -> Option<String> {
+pub fn system_http_proxy() -> Option<String> {
     None
 }
 

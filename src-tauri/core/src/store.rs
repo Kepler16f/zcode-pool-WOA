@@ -654,7 +654,7 @@ pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, S
     Ok(acc)
 }
 
-pub(crate) fn find_same_login(live: &Value, live_hash: &str, accounts: &[Account], home: &Path) -> Option<usize> {
+pub fn find_same_login(live: &Value, live_hash: &str, accounts: &[Account], home: &Path) -> Option<usize> {
     if let Some(i) = accounts.iter().position(|a| a.hash == live_hash) {
         return Some(i);
     }
@@ -1520,4 +1520,15 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),
     })
+}
+
+/// settings.json 的进程级写锁：账号切换 / 设置写入 / Web 控制台改配置共用，
+/// 防止「读-改-写」交错覆盖。桌面壳与无头守护（gatewayd）共用同一份逻辑。
+static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn store_guard() -> std::sync::MutexGuard<'static, ()> {
+    match STORE_LOCK.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }

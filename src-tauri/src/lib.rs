@@ -1,21 +1,10 @@
 pub mod cli;
-pub mod i18n;
-mod claim;
-mod driver;
-mod flowlog;
-mod gateway;
-mod graph;
-mod oauth;
-mod pool;
-mod prompt;
-mod quota;
-mod store;
-mod usage;
-mod zcrypto;
+use zcode_pool_core::{claim, driver, flowlog, gateway, graph, i18n, oauth, pool, quota};
+use zcode_pool_core::store;
+use zcode_pool_core::store::*;
 
 use serde_json::{json, Value};
-use std::sync::Mutex;
-use store::*;
+use std::sync::{Arc, Mutex};
 use tauri::menu::{MenuBuilder, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager};
@@ -24,7 +13,6 @@ use tauri_plugin_dialog::DialogExt;
 
 const TRAY_ID: &str = "main";
 
-static STORE_LOCK: Mutex<()> = Mutex::new(());
 
 struct PendingClaim {
     account_id: String,
@@ -40,13 +28,6 @@ static PENDING_CLAIM: Mutex<Option<PendingClaim>> = Mutex::new(None);
 
 fn pending_guard() -> std::sync::MutexGuard<'static, Option<PendingClaim>> {
     match PENDING_CLAIM.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-fn store_guard() -> std::sync::MutexGuard<'static, ()> {
-    match STORE_LOCK.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     }
@@ -297,30 +278,6 @@ fn claim_start_inner(
     Ok(json!({ "account": acc.name, "plan": display, "captcha": true }))
 }
 
-static LAST_CLAIM: Mutex<Option<Value>> = Mutex::new(None);
-
-fn last_claim_guard() -> std::sync::MutexGuard<'static, Option<Value>> {
-    match LAST_CLAIM.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-pub fn claim_last_result() -> Value {
-    last_claim_guard().clone().unwrap_or(Value::Null)
-}
-
-fn record_claim_result(payload: &Value) {
-    // ⚠ `at` 是给人看的字符串；前端要**比时间先后**，字符串比不了 ——
-    //   它和 unix 秒数相减会得到 NaN，判断恒为 false，成功分支就永远进不去
-    //   （症状：领取成功了却一直显示「正在领取中」然后超时）。所以另给一个数值 `atMs`。
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    *last_claim_guard() = Some(json!({ "at": store::now_ts(), "atMs": ms, "result": payload }));
-}
-
 pub fn emit_state_changed(app: &AppHandle) {
     let _ = app.emit("state-changed", ());
 }
@@ -368,7 +325,7 @@ async fn claim_captcha_submit(
                 server_time,
             };
             let p = serde_json::to_value(&outcome).unwrap_or(Value::Null);
-            record_claim_result(&p);
+            claim::record_result(&p);
             let _ = app.emit("claim://result", &p);
             p
         }
@@ -379,7 +336,7 @@ async fn claim_captcha_submit(
                 &pending.plan_name,
                 &e,
             );
-            record_claim_result(&p);
+            claim::record_result(&p);
             let _ = app.emit("claim://result", &p);
             return Ok(p);
         }
@@ -1537,10 +1494,8 @@ async fn open_external(url: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 
-static RELAY: std::sync::OnceLock<gateway::Gateway> = std::sync::OnceLock::new();
-
 fn relay() -> &'static gateway::Gateway {
-    RELAY.get_or_init(gateway::Gateway::new)
+    gateway::relay()
 }
 
 #[tauri::command]
@@ -1664,7 +1619,21 @@ pub fn run() {
 
             let paths = Paths::detect();
 
-            relay().set_app(app.handle().clone());
+            // 把桌面钩子注入核心：账号变化同步托盘/前端；Web 控制台领取套餐时弹验证码窗口。
+            // 无头形态（gatewayd/安卓）不注入这些，Web 端点自动降级为明确提示。
+            {
+                let app2 = app.handle().clone();
+                let app3 = app.handle().clone();
+                relay().set_hooks(
+                    Arc::new(move || {
+                        rebuild_tray(&app2);
+                        emit_state_changed(&app2);
+                    }),
+                    Arc::new(move |id: &str, plan_id: &str, auto: bool| {
+                        proxy_claim_start(&app3, id.to_string(), plan_id.to_string(), auto)
+                    }),
+                );
+            }
 
             relay().restore_persisted(&paths);
             // ⚠ 设置**只读一次**。以前这里读两遍（先判断开关、再取端口），
@@ -1677,7 +1646,7 @@ pub fn run() {
                     .unwrap_or(gateway::DEFAULT_PORT);
                 match relay().start(paths, want_port) {
                     Ok(_) => relay().set_external(true),
-                    Err(e) => crate::flowlog::log("relay", "start-fail", &e),
+                    Err(e) => zcode_pool_core::flowlog::log("relay", "start-fail", &e),
                 }
             }
             let _tray = TrayIconBuilder::with_id(TRAY_ID)

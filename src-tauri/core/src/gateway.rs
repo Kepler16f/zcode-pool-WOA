@@ -34,11 +34,11 @@ pub const MODEL_PINNED: &str = "pinned";
 
 pub const EXTERNAL_MODELS: [&str; 2] = ["GLM-5.3-Flash", "GLM-5.3"];
 
-const MINT_PAGE: &str = include_str!("../assets/mint.html");
+const MINT_PAGE: &str = include_str!("../../core/assets/mint.html");
 
-const CHAT_PAGE: &str = include_str!("../assets/chat.html");
+const CHAT_PAGE: &str = include_str!("../../core/assets/chat.html");
 
-const PROXY_PAGE: &str = include_str!("../assets/proxy.html");
+const PROXY_PAGE: &str = include_str!("../../core/assets/proxy.html");
 
 const CLIENT_HEADERS: [(&str, &str); 17] = [
     ("anthropic-version", "2023-06-01"),
@@ -269,7 +269,17 @@ impl Drop for BusyGuard {
 pub struct Gateway {
     inner: Arc<Mutex<Inner>>,
 
-    app: Arc<std::sync::OnceLock<tauri::AppHandle>>,
+    // 钩子用 Arc 包 Mutex：Gateway 需要 Clone（桌面壳的 RELAY 单例/多线程共享），
+    // 而 Mutex 本身不是 Clone；内部 Option 在 set_hooks 注入前为 None。
+    // 宿主注入的钩子：桌面壳注册后，账号变化同步托盘/前端、Web 端点可发起领取套餐；
+    // 无头运行（gatewayd / 安卓）不注入，相关能力自动降级。核心自身零 GUI 依赖。
+    hooks: Arc<Mutex<Hooks>>,
+}
+
+#[derive(Default)]
+struct Hooks {
+    on_change: Option<Arc<dyn Fn() + Send + Sync>>,
+    claim_start: Option<Arc<dyn Fn(&str, &str, bool) -> Result<Value, String> + Send + Sync>>,
 }
 
 struct Candidate {
@@ -293,18 +303,23 @@ impl Gateway {
         g
     }
 
-    pub fn set_app(&self, app: tauri::AppHandle) {
-        let _ = self.app.set(app);
-    }
-
-    fn app(&self) -> Option<tauri::AppHandle> {
-        self.app.get().cloned()
+    /// 桌面壳注入钩子：on_change = 账号/状态变化后同步托盘与前端；
+    /// claim_start = Web 控制台发起「领取套餐」时在桌面侧弹出验证码窗口。
+    pub fn set_hooks(
+        &self,
+        on_change: Arc<dyn Fn() + Send + Sync>,
+        claim_start: Arc<dyn Fn(&str, &str, bool) -> Result<Value, String> + Send + Sync>,
+    ) {
+        let mut h = self.hooks.lock().unwrap();
+        h.on_change = Some(on_change);
+        h.claim_start = Some(claim_start);
     }
 
     fn sync_exe(&self) {
-        if let Some(app) = self.app() {
-            crate::rebuild_tray(&app);
-            crate::emit_state_changed(&app);
+        if let Ok(h) = self.hooks.lock() {
+            if let Some(f) = &h.on_change {
+                f();
+            }
         }
     }
 
@@ -2572,7 +2587,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
         "/proxy/account/capture" => {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             let name = v.get("name").and_then(|x| x.as_str()).map(str::to_string).filter(|s| !s.trim().is_empty());
-            let r = { let _g = crate::store_guard(); store::capture_current(&paths, name) };
+            let r = { let _g = store::store_guard(); store::capture_current(&paths, name) };
             return match r {
                 Ok(a) => { gw.sync_exe(); reply_json_masked(req, 200, &json!(a), from_loopback) }
                 Err(e) => reply_json(req, 400, &json!({ "error": e })),
@@ -2582,7 +2597,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let r = { let _g = crate::store_guard(); store::rename_account(&paths, &id, &name) };
+            let r = { let _g = store::store_guard(); store::rename_account(&paths, &id, &name) };
             return match r {
                 Ok(a) => { gw.sync_exe(); reply_json_masked(req, 200, &json!(a), from_loopback) }
                 Err(e) => reply_json(req, 400, &json!({ "error": e })),
@@ -2591,7 +2606,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
         "/proxy/account/delete" => {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let r = { let _g = crate::store_guard(); store::delete_account(&paths, &id) };
+            let r = { let _g = store::store_guard(); store::delete_account(&paths, &id) };
             return match r {
                 Ok(()) => { gw.sync_exe(); reply_json(req, 200, &json!({ "ok": true, "status": gw.console_status(&paths) })) }
                 Err(e) => reply_json(req, 400, &json!({ "error": e })),
@@ -2600,7 +2615,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
         "/proxy/account/update-live" => {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let r = { let _g = crate::store_guard(); store::update_account_from_live(&paths, &id) };
+            let r = { let _g = store::store_guard(); store::update_account_from_live(&paths, &id) };
             return match r {
                 Ok(a) => { gw.sync_exe(); reply_json_masked(req, 200, &json!(a), from_loopback) }
                 Err(e) => reply_json(req, 400, &json!({ "error": e })),
@@ -2612,7 +2627,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let force = v.get("force").and_then(|x| x.as_bool()).unwrap_or(false);
             let restart = v.get("restart").and_then(|x| x.as_bool()).unwrap_or(true);
-            let r = { let _g = crate::store_guard(); store::switch_to(&paths, &id, force, restart) };
+            let r = { let _g = store::store_guard(); store::switch_to(&paths, &id, force, restart) };
             return match r {
                 Ok(s) => { gw.sync_exe(); reply_json(req, 200, &json!({ "result": s, "status": gw.console_status(&paths) })) }
                 Err(e) => reply_json(req, 400, &json!({ "error": e })),
@@ -2652,17 +2667,20 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let plan_id = v.get("plan_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let auto = v.get("auto").and_then(|x| x.as_bool()).unwrap_or(true);
-            let Some(app) = gw.app() else {
-                return reply_json(req, 400, &json!({ "error": "反代还没拿到 AppHandle（窗口环境未就绪），这一步暂时只能在 exe 面板做" }));
+            // 领取套餐要弹桌面验证码窗口，属于宿主能力：桌面壳注入 claim_start 钩子，
+            // 无头运行（gatewayd / 安卓）没有宿主，明确告知而不是静默失败。
+            let starter = gw.hooks.lock().unwrap().claim_start.clone();
+            let Some(starter) = starter else {
+                return reply_json(req, 503, &json!({ "error": "当前运行形态（无头/安卓）不弹验证码窗口，领取套餐请在桌面端操作" }));
             };
-            return match crate::proxy_claim_start(&app, id, plan_id, auto) {
+            return match starter(&id, &plan_id, auto) {
                 Ok(v) => reply_json(req, 200, &v),
                 Err(e) => reply_json(req, 400, &json!({ "error": e })),
             };
         }
 
         "/proxy/account/claim-result" => {
-            return reply_json(req, 200, &crate::claim_last_result());
+            return reply_json(req, 200, &crate::claim::last_result());
         }
 
         "/proxy/zcode/launch" => {
@@ -2684,7 +2702,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
         "/proxy/zcode/path" => {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let _g = crate::store_guard();
+            let _g = store::store_guard();
             let mut s = store::load_settings(&paths);
             s.zcode_path = store::normalize_zcode_path(&path);
             let r = store::save_settings(&paths, &s);
@@ -2725,7 +2743,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             let raw = v.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let root = paths.store_dir();
             let r = {
-                let _g = crate::store_guard();
+                let _g = store::store_guard();
                 let mut accounts = crate::pool::load(&root);
                 let rep = crate::pool::import(&mut accounts, &raw, store::now_ts());
                 match crate::pool::save(&root, &accounts) { Ok(()) => Ok(rep), Err(e) => Err(e) }
@@ -2740,7 +2758,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             let email = v.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let root = paths.store_dir();
             let r = {
-                let _g = crate::store_guard();
+                let _g = store::store_guard();
                 let mut accounts = crate::pool::load(&root);
                 let before = accounts.len();
                 accounts.retain(|a| !a.email.eq_ignore_ascii_case(email.trim()));
@@ -2759,7 +2777,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
                 .unwrap_or_default();
             let root = paths.store_dir();
             let r = {
-                let _g = crate::store_guard();
+                let _g = store::store_guard();
                 let mut accounts = crate::pool::load(&root);
                 let before = accounts.len();
                 accounts.retain(|a| !emails.contains(&a.email.trim().to_ascii_lowercase()));
@@ -2778,7 +2796,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             let note = v.get("note").and_then(|x| x.as_str()).map(str::to_string);
             let root = paths.store_dir();
             let r = {
-                let _g = crate::store_guard();
+                let _g = store::store_guard();
                 let mut accounts = crate::pool::load(&root);
                 if let Some(a) = crate::pool::find_mut(&mut accounts, &email) {
                     if ok {
@@ -2803,7 +2821,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             let email = v.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let root = paths.store_dir();
-            let r = { let _g = crate::store_guard(); crate::pool::set_status(&root, &email, crate::pool::STATUS_NEW, None) };
+            let r = { let _g = store::store_guard(); crate::pool::set_status(&root, &email, crate::pool::STATUS_NEW, None) };
             return match r {
                 Ok(()) => reply_json(req, 200, &json!({ "ok": true })),
                 Err(e) => reply_json(req, 400, &json!({ "error": e })),
@@ -2817,7 +2835,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             };
             let root = paths.store_dir();
             let r = {
-                let _g = crate::store_guard();
+                let _g = store::store_guard();
                 let mut accounts = crate::pool::load(&root);
                 let updated = if let Some(a) = crate::pool::find_mut(&mut accounts, &email) {
                     a.password = password;
@@ -2884,7 +2902,7 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
                 }
             };
             if let Some(rt) = new_rt {
-                let _g = crate::store_guard();
+                let _g = store::store_guard();
                 let mut accounts = crate::pool::load(&root);
                 if let Some(a) = crate::pool::find_mut(&mut accounts, &email) {
                     a.refresh_token = rt;
@@ -2988,4 +3006,11 @@ mod tests {
         assert!(gw.inner.lock().unwrap().blocked.remove("x").is_some());
         assert_eq!(gw.earliest_block(), None);
     }
+}
+
+/// 网关单例：桌面壳与 gatewayd 共用（号池状态、冷却表、在途计数都在这里）。
+static RELAY: std::sync::OnceLock<Gateway> = std::sync::OnceLock::new();
+
+pub fn relay() -> &'static Gateway {
+    RELAY.get_or_init(Gateway::new)
 }
