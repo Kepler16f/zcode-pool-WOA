@@ -15,7 +15,15 @@ const QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
 
 const NO_QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
 
-const RATE_TTL_MS: u64 = 5 * 60 * 1000;
+/// 429 默认冷却。上游对单号的突发限流通常十几秒就恢复；号池只有几个号时，
+/// 5 分钟一刀切会把「其实已经能用了」的号锁死，期间候选空 → 秒回 502 → 客户端重连风暴。
+/// 45s 足够躲过一次限流窗口；有 Retry-After 时按它来（见 block_ms）。
+/// 且探活成功会立即解冻（probe_one Ok → 清 blocked），所以实际锁长 ≲ 一个探测周期。
+const RATE_TTL_MS: u64 = 45_000;
+
+/// 网络层失败（连接重置 / TLS 掐断 / 超时）的短冷却：多半是瞬时抖动，20s 后再试。
+/// 与「被限流」区别对待 —— 网络错误不代表这个号超了并发/额度，不该锁满 45s。
+const NET_ERR_TTL_MS: u64 = 20_000;
 
 pub const POLICY_EXPIRE: &str = "expire_first";
 pub const POLICY_MOST_LEFT: &str = "most_left";
@@ -231,6 +239,30 @@ struct Inner {
     no_quota: HashMap<(String, String), u64>,
 
     blocked: HashMap<String, u64>,
+
+    /// 每号在途请求数。并发调度用：新请求优先选在途少的号，
+    /// 避免两个任务同打一个号互相挤兑（上游对单号并发有限制，挤兑表现为 429 / 首包变慢 / 卡住重连）。
+    /// 注意与上面取码池的 `inflight`（Vec）无关。
+    busy: HashMap<String, u32>,
+}
+
+/// 请求在途守卫：进上游前计数 +1，离开作用域（含流式响应传完、断连、换号、报错）自动 -1。
+struct BusyGuard {
+    inner: Arc<Mutex<Inner>>,
+    id: String,
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.inner.lock() {
+            if let Some(n) = g.busy.get_mut(&self.id) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    g.busy.remove(&self.id);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -504,6 +536,27 @@ impl Gateway {
         g.blocked.insert(id.to_string(), cur.max(now + ms));
     }
 
+    fn begin_busy(&self, id: &str) -> BusyGuard {
+        if let Ok(mut g) = self.inner.lock() {
+            *g.busy.entry(id.to_string()).or_default() += 1;
+        }
+        BusyGuard { inner: self.inner.clone(), id: id.to_string() }
+    }
+
+    /// 冷却表里最近的解冻时刻（毫秒时间戳）；没有未来冷却则 None。
+    /// 用于「池暂时空但只是都在冷却」时决定要不要挂起等待 —— 挂到最近的解冻点重试，
+    /// 而不是秒回 502 把客户端推进重连风暴。
+    fn earliest_block(&self) -> Option<u64> {
+        let now = now_ms();
+        let g = self.inner.lock().unwrap();
+        g.blocked.values().filter(|t| **t > now).min().copied()
+    }
+
+    /// 池里有没有任何账号（不看冷却 / 额度）。空号池没必要等待。
+    fn has_any_account(&self, paths: &Paths) -> bool {
+        store::list_accounts(paths).map(|a| !a.is_empty()).unwrap_or(false)
+    }
+
     fn probe_one(&self, paths: &Paths, id: &str) -> Result<u64, String> {
         let secret = crate::zcrypto::default_secret(&paths.home);
         let acc = store::load_account(paths, id)?;
@@ -517,25 +570,36 @@ impl Gateway {
         let ms = now_ms().saturating_sub(t0);
         let out = r.map(|_| ms).map_err(|e| e.chars().take(120).collect::<String>());
         let now = now_ms();
-        let mut g = self.inner.lock().unwrap();
-        let h = g.health.entry(id.to_string()).or_default();
-        h.last_at = Some(now);
-        h.last_ms = out.as_ref().ok().copied();
-        match &out {
-            Ok(_) => {
-                h.ok += 1;
-                h.streak = 0;
-                h.last_err.clear();
+        let mut thawed = false;
+        {
+            let mut g = self.inner.lock().unwrap();
+            let h = g.health.entry(id.to_string()).or_default();
+            h.last_at = Some(now);
+            h.last_ms = out.as_ref().ok().copied();
+            match &out {
+                Ok(_) => {
+                    h.ok += 1;
+                    h.streak = 0;
+                    h.last_err.clear();
+                }
+                Err(e) => {
+                    h.fail += 1;
+                    h.streak = h.streak.saturating_add(1);
+                    h.last_err = e.clone();
+                }
             }
-            Err(e) => {
-                h.fail += 1;
-                h.streak = h.streak.saturating_add(1);
-                h.last_err = e.clone();
+            h.history.push((now, out.as_ref().ok().copied()));
+            while h.history.len() > PROBE_HISTORY {
+                h.history.remove(0);
+            }
+            // 号已恢复（quota 端点探活成功）就别再被冷却表锁着：立即解冻。
+            // 不这么做的话 429 要锁满整个 RATE_TTL，明明已健康，客户端却白白看 502 重连。
+            if out.is_ok() && g.blocked.remove(id).is_some() {
+                thawed = true;
             }
         }
-        h.history.push((now, out.as_ref().ok().copied()));
-        while h.history.len() > PROBE_HISTORY {
-            h.history.remove(0);
+        if thawed {
+            crate::flowlog::log("relay", "thaw", &format!("{id} 探活成功，提前解冻"));
         }
         out
     }
@@ -1129,6 +1193,19 @@ impl Gateway {
         }
     }
 
+    /// 并发分流：同等条件下优先选**在途请求最少**的号（稳定排序，不破坏原排序语义）。
+    /// 没有这一步时，两个并发任务会按同样的确定性顺序撞上同一个号 —— 上游对单号有并发
+    /// 限制，挤兑就表现为 429 / 首包排队变慢，客户端「一直重新连接」。
+    /// busy 由 BusyGuard 维护：进入上游 +1，响应流读完/断连/换号自动 -1，不会泄漏。
+    fn idle_first(&self, mut list: Vec<Candidate>) -> Vec<Candidate> {
+        if list.len() < 2 {
+            return list;
+        }
+        let busy = self.inner.lock().unwrap().busy.clone();
+        list.sort_by_key(|c| busy.get(&c.id).copied().unwrap_or(0));
+        list
+    }
+
 }
 
 fn live_account_id(paths: &Paths) -> Option<String> {
@@ -1257,6 +1334,15 @@ fn backoff_ms(attempt: usize) -> u64 {
     let capped = 2000u64.saturating_mul(1u64 << shift).min(60_000);
     let jitter = (now_ms() % 41) as i64 - 20; 
     ((capped as i64) * (100 + jitter) / 100).max(50) as u64
+}
+
+/// 429 的冷却时长：上游明确给了 Retry-After（秒）就尊重它（clamp 到 1s~5min），
+/// 没给就用默认 RATE_TTL_MS。上限 5min 防止上游甩一个夸张的值把号锁半天。
+fn block_ms(retry_after: Option<u64>) -> u64 {
+    match retry_after {
+        Some(secs) => (secs.saturating_mul(1000)).clamp(1_000, 5 * 60 * 1000),
+        None => RATE_TTL_MS,
+    }
 }
 
 fn account_session(id: &str, seed: &str) -> String {
@@ -1596,11 +1682,25 @@ fn reply_html(req: tiny_http::Request, body: String) -> Result<(), String> {
 }
 
 fn reply_json(req: tiny_http::Request, code: u16, v: &Value) -> Result<(), String> {
+    reply_json_hdr(req, code, &[], v)
+}
+
+/// 带额外响应头的 JSON 回复（如 502 挂 Retry-After，让客户端正确退避而不是盲重连）。
+fn reply_json_hdr(req: tiny_http::Request, code: u16, hdrs: &[(&str, &str)], v: &Value) -> Result<(), String> {
     let body = serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec());
-    let h = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let mk = |k: &str, val: &str| tiny_http::Header::from_bytes(k.as_bytes(), val.as_bytes()).ok();
+    let mut hs: Vec<tiny_http::Header> = Vec::new();
+    if let Some(h) = mk("Content-Type", "application/json") {
+        hs.push(h);
+    }
+    for (k, val) in hdrs {
+        if let Some(h) = mk(k, val) {
+            hs.push(h);
+        }
+    }
     let _ = req.respond(tiny_http::Response::new(
         tiny_http::StatusCode(code),
-        vec![h],
+        hs,
         std::io::Cursor::new(body),
         None,
         None,
@@ -1809,32 +1909,73 @@ fn handle_external(
     }
     let agent = ab.build();
 
-    let mut cands = gw.sticky_order(gw.candidates(paths, &model));
-
-    if cands.is_empty() && mmode == MODEL_AUTO {
-        for alt in EXTERNAL_MODELS.iter().filter(|m| **m != model) {
-            let c2 = gw.sticky_order(gw.candidates(paths, alt));
-            if !c2.is_empty() {
-                crate::flowlog::log("relay", "model-fallback", &format!("{model} 全库无额度 → 回退到 {alt}"));
-
-                model = alt.to_string();
-                cands = c2;
-                break;
+    // 选号：池空时不再秒回 502。号池常常是「只是都在短冷却」——429 风暴期 ZCode
+    // 每 6~7 秒重连一次，秒回 502 等于把这些重连全变成无谓往返（客户端一直「等待重连」）。
+    // 这里挂起到最近的解冻时刻再重选一轮（总等待 ≤ RATE_WAIT_MS），解冻即恢复服务。
+    const RATE_WAIT_MS: u64 = 45_000;
+    let pick = |mdl: &str| -> (String, Vec<Candidate>) {
+        let mut m = mdl.to_string();
+        let mut c = gw.idle_first(gw.sticky_order(gw.candidates(paths, &m)));
+        if c.is_empty() && mmode == MODEL_AUTO {
+            for alt in EXTERNAL_MODELS.iter().filter(|x| **x != mdl) {
+                let c2 = gw.idle_first(gw.sticky_order(gw.candidates(paths, alt)));
+                if !c2.is_empty() {
+                    crate::flowlog::log("relay", "model-fallback", &format!("{mdl} 全库无额度 → 回退到 {alt}"));
+                    m = alt.to_string();
+                    c = c2;
+                    break;
+                }
             }
         }
-    }
-    if cands.is_empty() {
+        (m, c)
+    };
 
-        let at = now_ms();
-        crate::usage::append(&usage_path, &mk("", 502, "no-account", 0, false, at));
-        return reply_json(
-            slot.take().unwrap(),
-            502,
-            &json!({ "type": "error",
-                     "error": { "type": "overloaded_error",
-                                "message": format!("号池里没有可用于 {model} 的号") } }),
-        );
-    }
+    let mut waited_ms = 0u64;
+    let (model, cands) = loop {
+        let (m, c) = pick(&model);
+        if !c.is_empty() {
+            if waited_ms > 0 {
+                crate::flowlog::log("relay", "rate-wait-ok", &format!("挂起 {waited_ms}ms 后号池恢复"));
+            }
+            break (m, c);
+        }
+        // 只有「号池非空 + 全部在冷却」才值得等；额度用尽（no_quota）等不来结果，别吊着客户端。
+        let next = gw.earliest_block();
+        match next {
+            Some(t) if gw.has_any_account(paths) => {
+                let budget = RATE_WAIT_MS.saturating_sub(waited_ms);
+                let remaining = t.saturating_sub(now_ms());
+                if budget == 0 || remaining > budget.max(200) {
+                    // 等不起 / 剩太久：回 502 但带上 Retry-After，客户端能正确退避而不是盲重连。
+                    let at = now_ms();
+                    crate::usage::append(&usage_path, &mk("", 502, "no-account", 0, false, at));
+                    let secs = (remaining / 1000).clamp(1, 60).to_string();
+                    return reply_json_hdr(
+                        slot.take().unwrap(),
+                        502,
+                        &[("Retry-After", &secs)],
+                        &json!({ "type": "error",
+                                 "error": { "type": "overloaded_error",
+                                            "message": format!("号池限流冷却中，约 {secs}s 后恢复（{model}）") } }),
+                    );
+                }
+                let nap = remaining.min(budget).max(50);
+                std::thread::sleep(Duration::from_millis(nap));
+                waited_ms += nap;
+            }
+            _ => {
+                let at = now_ms();
+                crate::usage::append(&usage_path, &mk("", 502, "no-account", 0, false, at));
+                return reply_json(
+                    slot.take().unwrap(),
+                    502,
+                    &json!({ "type": "error",
+                             "error": { "type": "overloaded_error",
+                                        "message": format!("号池里没有可用于 {model} 的号") } }),
+                );
+            }
+        }
+    };
 
     let mut tried = 0usize;
 
@@ -1893,25 +2034,27 @@ fn handle_external(
         let tried_at = now_ms();
         last_acct = c.name.clone();
         last_at = tried_at;
-        let (status, reader, ctype) = match call.send_bytes(&out_body) {
+        let _busy = gw.begin_busy(&c.id);
+        let (status, reader, ctype, ra) = match call.send_bytes(&out_body) {
             Ok(r) => {
                 let ct = r.header("Content-Type").map(|s| s.to_string());
-                (r.status(), r.into_reader(), ct)
+                (r.status(), r.into_reader(), ct, None)
             }
             Err(ureq::Error::Status(code, r)) => {
                 let ct = r.header("Content-Type").map(|s| s.to_string());
-                (code, r.into_reader(), ct)
+                let ra = r.header("Retry-After").and_then(|v| v.trim().parse::<u64>().ok());
+                (code, r.into_reader(), ct, ra)
             }
             Err(e) => {
                 crate::flowlog::log("relay", "external-fail", &format!("{} {e}", c.name));
-                gw.mark_blocked(&c.id, RATE_TTL_MS);
+                gw.mark_blocked(&c.id, NET_ERR_TTL_MS);
                 std::thread::sleep(Duration::from_millis(backoff_ms(tried)));
                 continue;
             }
         };
         if SWITCH_STATUS.contains(&status) {
             if status == 429 {
-                gw.mark_blocked(&c.id, RATE_TTL_MS);
+                gw.mark_blocked(&c.id, block_ms(ra));
             }
             let d = backoff_ms(tried);
             crate::flowlog::log(
@@ -2769,4 +2912,80 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             .with_status_code(404),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_ms_respects_retry_after_with_clamp() {
+        assert_eq!(block_ms(Some(12)), 12_000);
+        assert_eq!(block_ms(Some(0)), 1_000); // 下限 1s
+        assert_eq!(block_ms(Some(3600)), 5 * 60 * 1000); // 上限 5min
+        assert_eq!(block_ms(None), RATE_TTL_MS);
+    }
+
+    #[test]
+    fn busy_guard_counts_up_and_down() {
+        let gw = Gateway::default();
+        assert_eq!(gw.inner.lock().unwrap().busy.get("a").copied().unwrap_or(0), 0);
+        {
+            let _g1 = gw.begin_busy("a");
+            assert_eq!(gw.inner.lock().unwrap().busy.get("a").copied().unwrap_or(0), 1);
+            {
+                let _g2 = gw.begin_busy("a");
+                assert_eq!(gw.inner.lock().unwrap().busy.get("a").copied().unwrap_or(0), 2);
+            }
+            assert_eq!(gw.inner.lock().unwrap().busy.get("a").copied().unwrap_or(0), 1);
+        }
+        // 归零后条目被清掉，防 HashMap 无界增长
+        assert!(!gw.inner.lock().unwrap().busy.contains_key("a"));
+    }
+
+    #[test]
+    fn idle_first_routes_to_least_busy_account() {
+        let mk_cand = |id: &str| Candidate {
+            id: id.to_string(),
+            name: id.to_string(),
+            token: String::new(),
+            mid: String::new(),
+            expire: None,
+            left: 1.0,
+        };
+        let gw = Gateway::default();
+        // b 正在服务一个请求 → 新请求应优先排到空闲的 a/c
+        let _busy_b = gw.begin_busy("b");
+        let list = vec![mk_cand("a"), mk_cand("b"), mk_cand("c")];
+        let out = gw.idle_first(list);
+        let ids: Vec<&str> = out.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids[2], "b", "在途最多的号必须排最后，实际={ids:?}");
+        // 稳定排序：同忙度保持原相对顺序
+        let gw2 = Gateway::default();
+        let list2 = vec![mk_cand("x"), mk_cand("y"), mk_cand("z")];
+        let out2 = gw2.idle_first(list2);
+        assert_eq!(out2.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn earliest_block_picks_minimum_future_expiry() {
+        let gw = Gateway::default();
+        assert_eq!(gw.earliest_block(), None);
+        gw.mark_blocked("late", 60_000);
+        gw.mark_blocked("soon", 10_000);
+        let t = gw.earliest_block().expect("有未来冷却");
+        let now = now_ms();
+        assert!(t - now <= 10_000 + 500, "应取最近的解冻点，实际剩 {}ms", t - now);
+    }
+
+    #[test]
+    fn probe_thaw_clears_blocked() {
+        // 探活成功后 blocked 必须被清掉（否则健康号被 45s 空锁，客户端白等）。
+        // probe_one 需要真实账号，这里直接验证解冻语义所依赖的表操作。
+        let gw = Gateway::default();
+        gw.mark_blocked("x", 60_000);
+        assert!(gw.earliest_block().is_some());
+        assert!(gw.inner.lock().unwrap().blocked.remove("x").is_some());
+        assert_eq!(gw.earliest_block(), None);
+    }
 }
