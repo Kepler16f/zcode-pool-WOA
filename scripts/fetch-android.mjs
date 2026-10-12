@@ -3,7 +3,9 @@
 // 2) 找到 origin 仓最新完成的 Android run，下载 artifact
 // 3) 取其中 .apk 放进 release/ 和下载文件夹
 // 用法：node scripts/fetch-android.mjs
-import { execSync } from "node:child_process";
+// ⚠ Windows 下 execSync 走 cmd.exe，命令行里的引号/管道会被它吃掉 —— 一切 gh 调用
+//   都走 execFileSync(数组参数)，过滤逻辑放在 JS 里做，jq 只用最简形式。
+import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -11,12 +13,12 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const fail = (m) => { console.error(`[apk] ✗ ${m}`); process.exit(1); };
-const sh = (cmd) => execSync(cmd, { cwd: root, encoding: "utf8" }).trim();
+const gh = (...args) => execFileSync("gh", args, { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).trim();
 
 // 仓库坐标从 origin 推（不写死）：…:Kepler16f/zcode-pool-WOA.git → Kepler16f/zcode-pool-WOA
 let repo;
 try {
-  const url = sh("git remote get-url origin");
+  const url = execFileSync("git", ["remote", "get-url", "origin"], { cwd: root, encoding: "utf8" }).trim();
   const m = url.match(/[:/]([^/]+\/[^/]+?)(?:\.git)?$/);
   if (!m) fail(`无法从 origin 解析仓库：${url}`);
   repo = m[1];
@@ -41,22 +43,25 @@ const cleanApks = (dir, label) => {
 cleanApks(outDir, "release/");
 cleanApks(downloads, "下载文件夹");
 
-// ② 最新一次 Android run（completed），拿它的 id
+// ② 最新一次 Android run（completed）：列表拉回 JS 过滤，避免 --jq select 在 cmd 下被拆
 let runId;
+let conclusion;
 try {
-  runId = sh(`gh api "repos/${repo}/actions/runs?per_page=15" --jq '[.workflow_runs[] | select(.name=="Android" and .status=="completed")][0].id'`);
+  const data = JSON.parse(gh("api", `repos/${repo}/actions/runs?per_page=15`));
+  const run = data.workflow_runs.find((r) => r.name === "Android" && r.status === "completed");
+  if (!run) fail("还没找到已完成的 Android 构建（先推代码触发 CI）");
+  runId = String(run.id);
+  conclusion = run.conclusion;
 } catch (e) {
   fail(`gh api 失败（检查 gh auth）：${e.message}`);
 }
-if (!runId || runId === "null") fail("还没找到已完成的 Android 构建（先推代码触发 CI）");
-const conclusion = sh(`gh api "repos/${repo}/actions/runs/${runId}" --jq .conclusion`);
 if (conclusion !== "success") fail(`最新 Android run ${runId} 结论是 ${conclusion}，没有可取的 APK`);
 console.log(`[apk] run ${runId} (${conclusion})`);
 
 // ③ 下载 artifact 并取 apk
 const tmp = join(outDir, ".apk-tmp");
 rmSync(tmp, { recursive: true, force: true });
-sh(`gh run download ${runId} --repo ${repo} --dir "${tmp}"`);
+gh("run", "download", runId, "--repo", repo, "--dir", tmp);
 const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
   e.isDirectory() ? walk(join(dir, e.name)) : [join(dir, e.name)]);
 const apk = walk(tmp).find((p) => p.toLowerCase().endsWith(".apk"));
