@@ -11,6 +11,17 @@ pub const UPSTREAM: &str = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
 pub const DEFAULT_PORT: u16 = 8899;
 const SWITCH_STATUS: [u16; 4] = [401, 402, 403, 429];
 const MAX_TRIES: usize = 4;
+
+/// 上游 3012 实测阈值：一条对话被「超过 2 个账号」服务过就永久拉黑（v0.2.0 release 说明）。
+/// 绑定推进上限取 2：第 1 号额度耗尽可换第 2 号，再耗尽就不再换（换=踩雷），报提示开新对话。
+const MAX_CONV_ACCOUNTS: usize = 2;
+/// 对话绑定与 3012 黑名单的 TTL / 条数上限（LRU 淘汰，防长会话积累）。
+const CONV_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+/// 3012 对话的本地冷却。上游说「同对话 >2 号永久拉黑」，但实测新对话也会 3012
+/// （更像 IP/池级限流），所以本地**不永久封**：冷却一段时间后允许同一对话重试，
+/// 避免误杀一整天的正常会话。真正防串号靠绑定，这块只是止住对已死对话的反复空烧。
+const CONV_BLOCK_TTL_MS: u64 = 30 * 60 * 1000;
+const CONV_MAP_CAP: usize = 4000;
 const QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
 
 const NO_QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
@@ -244,6 +255,23 @@ struct Inner {
     /// 避免两个任务同打一个号互相挤兑（上游对单号并发有限制，挤兑表现为 429 / 首包变慢 / 卡住重连）。
     /// 注意与上面取码池的 `inflight`（Vec）无关。
     busy: HashMap<String, u32>,
+
+    /// 对话 → 绑定账号（3012 风控对策）。上游实测：**同一条对话被超过 2 个账号服务过**
+    /// 就触发风控（3012），此后这条对话用任何号都过不去 —— 而默认的换号策略恰恰会在
+    /// 429/额度尽时把一条对话接力给下一个号，等于主动踩雷。这里给每条对话钉一个号：
+    /// 除非这个号对该模型真的没额度了（candidates 里没有它）才解绑换号，其余错误
+    /// （429/网络抖动/3012）都等原号，不换。绑定最多推进 2 个号（第 3 个号 = 上游雷区）。
+    /// conv_bindings 会被 persist_bindings 落盘（重启不丢绑定 → 不产生“第二次换号”）。
+    conv_bindings: HashMap<u64, ConvBinding>,
+    /// 被 3012 判过的对话指纹：命中直接拒，不再拿任何号去喂（保护整个池）。
+    conv_blocked: HashMap<u64, u64>,
+}
+
+/// 一条对话用过的账号（按先后），最多 MAX_CONV_ACCOUNTS 个。
+#[derive(Default)]
+struct ConvBinding {
+    accounts: Vec<String>,
+    last_seen: u64,
 }
 
 /// 请求在途守卫：进上游前计数 +1，离开作用域（含流式响应传完、断连、换号、报错）自动 -1。
@@ -282,6 +310,7 @@ struct Hooks {
     claim_start: Option<Arc<dyn Fn(&str, &str, bool) -> Result<Value, String> + Send + Sync>>,
 }
 
+#[derive(Clone)]
 struct Candidate {
     id: String,
     name: String,
@@ -456,6 +485,8 @@ impl Gateway {
             "routedQuota": quota_rows_for(&g, route_id.as_deref()),
             "clientQuota": quota_rows_for(&g, client_id.as_deref()),
             "blocked": g.blocked.values().filter(|t| **t > now_ms()).count(),
+            "convBindings": g.conv_bindings.len(),
+            "convCooling": g.conv_blocked.values().filter(|t| **t > now_ms()).count(),
             "policy": g.policy,
             "pinned": g.pinned,
             "sticky": g.sticky,
@@ -701,6 +732,9 @@ impl Gateway {
             g.last_refresh = cached.1;
             crate::flowlog::log("relay", "quota-cache-load", &format!("从盘上恢复了 {} 个号的额度", g.quota.len()));
         }
+        drop(g);
+        // 恢复对话→账号绑定（load_bindings 自己取锁，必须在 g 释放后调用）。
+        self.load_bindings(paths);
     }
 
     pub fn set_model_map(&self, paths: &Paths, from: &str, to: &str) -> Result<Value, String> {
@@ -1362,6 +1396,128 @@ fn block_ms(retry_after: Option<u64>) -> u64 {
     }
 }
 
+/// 对话指纹：Anthropic 格式里请求只带历史消息，`messages[0]`（开场轮）整段会话逐字不变
+/// （每轮 x-request-id 是新的，不能当锚点）。**只用开场轮**：多取几条会在第二轮"分裂"成
+/// 两个指纹 —— 同一条对话各自推进两个号，合计 4 个，正好踩「>2 号 = 3012」的雷。
+/// 反过来"误合并"（两条对话都以 hi 之类的开场撞指纹）只是共享同一个号，方向是安全的。
+/// 不含模型：同一条对话中途换模型还是同一条对话，按模型分叉绑定同样会推进超 2 个号。
+fn conversation_fingerprint(body: &[u8]) -> Option<u64> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let msgs = v.get("messages")?.as_array()?;
+    let mut h = Sha256::new();
+    h.update(b"zpool-conv|");
+    h.update(serde_json::to_vec(msgs.first()?).ok()?.as_slice());
+    let d = h.finalize();
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&d[..8]);
+    Some(u64::from_le_bytes(a))
+}
+
+impl Gateway {
+    /// 查/登记对话绑定：返回该对话当前应锁定的账号 id（None = 还没绑过）。
+    pub fn bound_account(&self, conv: u64) -> Option<String> {
+        let mut guard = self.inner.lock().unwrap();
+        let g = &mut *guard;
+        prune_conv(&mut g.conv_bindings, &mut g.conv_blocked, now_ms());
+        g.conv_bindings.get(&conv).and_then(|b| b.accounts.last().cloned())
+    }
+
+    /// 该对话用过的账号历史（含当前）。
+    fn conv_history(&self, conv: u64) -> Vec<String> {
+        self.inner.lock().unwrap().conv_bindings.get(&conv).map(|b| b.accounts.clone()).unwrap_or_default()
+    }
+
+    /// 把账号推进/登记为对话绑定（追加，上限 MAX_CONV_ACCOUNTS）。返回是否新增。
+    fn bind_account(&self, conv: u64, id: &str) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let now = now_ms();
+        let b = g.conv_bindings.entry(conv).or_default();
+        let changed = !b.accounts.iter().any(|x| x == id);
+        if changed {
+            b.accounts.push(id.to_string());
+        }
+        b.last_seen = now;
+        changed
+    }
+
+    /// 号在该模型上「额度用尽」标记。no_quota 表原本只有读没有写（1005 走 200+JSON 的
+    /// abnormal 路径，直接 continue 换号）；对话绑定需要它来区分「bound 号是冷却（等）」
+    /// 还是「真没额度（才允许换）」。
+    fn mark_no_quota(&self, id: &str, model: &str) {
+        let mut g = self.inner.lock().unwrap();
+        g.no_quota.insert((id.to_string(), model_key(model)), now_ms());
+    }
+
+    fn is_blocked(&self, id: &str) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.blocked.get(id).map(|t| *t > now_ms()).unwrap_or(false)
+    }
+
+    /// 清空全部对话绑定 + 3012 黑名单（Web 控制台「解除对话绑定」按钮）。
+    pub fn reset_conv_bindings(&self, paths: &Paths) -> usize {
+        let mut g = self.inner.lock().unwrap();
+        let n = g.conv_bindings.len() + g.conv_blocked.len();
+        g.conv_bindings.clear();
+        g.conv_blocked.clear();
+        drop(g);
+        let _ = store::atomic_write(&paths.store_dir().join("conv-bindings.json"), "{}");
+        n
+    }
+
+    fn is_conv_blocked(&self, conv: u64) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.conv_blocked.get(&conv).map(|t| *t > now_ms()).unwrap_or(false)
+    }
+
+    /// 上游 3012：这条对话大概率已被拉黑，短时间内别再拿任何号去撞（每次撞白烧额度，
+    /// 还可能把号拖下水）。本地记 CONV_BLOCK_TTL_MS 冷却而非永久 —— 实测新对话也会被
+    /// 3012（更像 IP/池级限流），永久封会误杀一整天的正常会话；到期后放行重试，
+    /// 若上游仍判死会再次进入冷却。
+    fn block_conv(&self, conv: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.conv_blocked.insert(conv, now_ms() + CONV_BLOCK_TTL_MS);
+    }
+
+    pub fn save_bindings(&self, paths: &Paths) {
+        let g = self.inner.lock().unwrap();
+        let map: serde_json::Map<String, Value> = g
+            .conv_bindings
+            .iter()
+            .map(|(k, b)| (k.to_string(), json!(b.accounts)))
+            .collect();
+        let _ = store::atomic_write(&paths.store_dir().join("conv-bindings.json"), &serde_json::to_string(&map).unwrap_or_default());
+    }
+
+    pub fn load_bindings(&self, paths: &Paths) {
+        let Ok(s) = std::fs::read_to_string(paths.store_dir().join("conv-bindings.json")) else { return };
+        let Ok(v) = serde_json::from_str::<Value>(&s) else { return };
+        let mut g = self.inner.lock().unwrap();
+        if let Some(o) = v.as_object() {
+            for (k, arr) in o {
+                let Ok(key) = k.parse::<u64>() else { continue };
+                let Some(list) = arr.as_array() else { continue };
+                let accounts: Vec<String> = list.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+                if !accounts.is_empty() {
+                    g.conv_bindings.insert(key, ConvBinding { accounts, last_seen: now_ms() });
+                }
+            }
+        }
+    }
+}
+
+fn prune_conv(binds: &mut HashMap<u64, ConvBinding>, blocked: &mut HashMap<u64, u64>, now: u64) {
+    binds.retain(|_, b| b.last_seen + CONV_TTL_MS > now);
+    if binds.len() > CONV_MAP_CAP {
+        // 容量兜底：按最久未用淘汰
+        let mut order: Vec<(u64, u64)> = binds.iter().map(|(k, b)| (*k, b.last_seen)).collect();
+        order.sort_by_key(|(_, t)| *t);
+        for (k, _) in order.iter().take(binds.len() - CONV_MAP_CAP) {
+            binds.remove(k);
+        }
+    }
+    blocked.retain(|_, t| *t > now);
+}
+
 fn account_session(id: &str, seed: &str) -> String {
     let mut h = Sha256::new();
     h.update(b"zpool-sid|");
@@ -1910,6 +2066,11 @@ fn handle_external(
         model = to;
     }
 
+    // 对话指纹（3012 风控对策的锚点）：上游实测同一条对话被 ≥2 个账号服务过就永久拉黑。
+    // 后面据此做两件事：① 已判死的对话直接拒（不再浪费任何号）；② 对话钉死一个号，
+    // 只有这个号对所有模型真没额度了才推进下一个（其余错误等原号，不串号）。
+    let conv = conversation_fingerprint(body);
+
     let usage_path = crate::usage::path_for(&paths.store_dir());
 
     let mk = |acct: &str, status: u16, code: &str, tries: usize, stream: bool, t: u64| {
@@ -1945,10 +2106,30 @@ fn handle_external(
     }
     let agent = ab.build();
 
+    // 近期在这条对话上撞过 3012 的冷却窗口：暂停向它投放任何号（每撞一次白烧额度，
+    // 还可能把号拖下水）。到期后放它重试 —— 本地不永久封，判死与否交上游说了算。
+    if let Some(c) = conv {
+        if gw.is_conv_blocked(c) {
+            crate::usage::append(&usage_path, &mk("", 405, "3012", 0, false, now_ms()));
+            return reply_json(
+                slot.take().unwrap(),
+                405,
+                &json!({ "type": "error",
+                         "error": { "type": "rate_limit_error",
+                                    "message": "这条对话刚触发过上游风控 3012，网关暂时不再向它投放账号（冷却中）。稍等自动恢复；若反复如此，请开一条新对话。" } }),
+            );
+        }
+    }
+
     // 选号：池空时不再秒回 502。号池常常是「只是都在短冷却」——429 风暴期 ZCode
     // 每 6~7 秒重连一次，秒回 502 等于把这些重连全变成无谓往返（客户端一直「等待重连」）。
     // 这里挂起到最近的解冻时刻再重选一轮（总等待 ≤ RATE_WAIT_MS），解冻即恢复服务。
     const RATE_WAIT_MS: u64 = 45_000;
+    // 对话绑定的号（若有）：候选里有它 → 只发它（不串号）；没有它（该号对所有模型都没
+    // 额度了）且已用号数 < 上限 → 允许推进一个新号；已用号数达上限还不绑不到 → 不越界。
+    let bound = conv.and_then(|c| gw.bound_account(c));
+    let conv_used = conv.map(|c| gw.conv_history(c).len()).unwrap_or(0);
+    let at_bind_cap = conv.map(|_| conv_used >= MAX_CONV_ACCOUNTS).unwrap_or(false);
     let pick = |mdl: &str| -> (String, Vec<Candidate>) {
         let mut m = mdl.to_string();
         let mut c = gw.idle_first(gw.sticky_order(gw.candidates(paths, &m)));
@@ -1968,7 +2149,26 @@ fn handle_external(
 
     let mut waited_ms = 0u64;
     let (model, cands) = loop {
-        let (m, c) = pick(&model);
+        let (m, mut c) = pick(&model);
+        // 对话绑定：绑定号仍在候选（对该模型有额度）→ 本轮只发它，绝不串号；
+        // 绑定号在冷却 → 清空候选走下面的等待（等原号解冻，不换）；
+        // 绑定号真没额度 → 未达上限则放开选新号（成功后 bind 推进），达上限则拒绝（换=踩雷）。
+        if let Some(bid) = &bound {
+            if c.iter().any(|x| &x.id == bid) {
+                c.retain(|x| &x.id == bid);
+            } else if gw.is_blocked(bid) {
+                c.clear();
+            } else if at_bind_cap {
+                crate::usage::append(&usage_path, &mk("", 503, "conv-exhausted", 0, false, now_ms()));
+                return reply_json(
+                    slot.take().unwrap(),
+                    503,
+                    &json!({ "type": "error",
+                             "error": { "type": "overloaded_error",
+                                        "message": format!("这条对话用过的 {conv_used} 个号额度都尽了。为避免触发风控（同对话 >2 号即被拉黑），不再自动换号——请开新对话，或给号池补充额度。") } }),
+                );
+            }
+        }
         if !c.is_empty() {
             if waited_ms > 0 {
                 crate::flowlog::log("relay", "rate-wait-ok", &format!("挂起 {waited_ms}ms 后号池恢复"));
@@ -1998,6 +2198,9 @@ fn handle_external(
                 let nap = remaining.min(budget).max(50);
                 std::thread::sleep(Duration::from_millis(nap));
                 waited_ms += nap;
+                // 等待期间额度缓存可能过期或绑定号解冻 → 刷新额度再重选，否则 bound 号
+                // 的 candidates 结果不会变化（缓存里它仍「无额度」），会空等一轮。
+                let _ = gw.refresh_quota(paths, false);
             }
             _ => {
                 let at = now_ms();
@@ -2101,6 +2304,38 @@ fn handle_external(
             std::thread::sleep(Duration::from_millis(d));
             continue;
         }
+        // 非 200 / 非 SWITCH_STATUS 的错误（如上游 3012 走的 405）：以前会当"成功"
+        // 原样透传给客户端 —— 客户端盲目重试就继续换号喂这条对话，把整个池一个接一个
+        // 拖进雷区。现在：非流式体里找 code；3012 → 拉黑该对话 + 明确报错；
+        // 其余错误码 → 透传不重试（透传给客户端至少能看到真实原因）。
+        if status >= 400 {
+            let mut err_head = Vec::new();
+            let _ = reader.take(8192).read_to_end(&mut err_head);
+            let code = peek_code(&err_head);
+            if code == "3012" {
+                if let Some(cv) = conv {
+                    gw.block_conv(cv);
+                    crate::flowlog::log("relay", "conv-blocked", &format!("{} 3012 → 该对话永久拒绝", c.name));
+                }
+                crate::usage::append(&usage_path, &mk(&c.name, status, "3012", tried, false, tried_at));
+                return reply_json(
+                    slot.take().unwrap(),
+                    status,
+                    &json!({ "type": "error",
+                             "error": { "type": "rate_limit_error",
+                                        "message": "上游风控 3012：这条对话已被拉黑，换号也无法恢复。请开一条新对话。" } }),
+                );
+            }
+            let msg: String = String::from_utf8_lossy(&err_head).chars().take(300).collect();
+            crate::usage::append(&usage_path, &mk(&c.name, status, &code, tried, false, tried_at));
+            crate::flowlog::log("relay", "upstream-err", &format!("{} HTTP {status} code={code} {msg}", c.name));
+            return reply_json(
+                slot.take().unwrap(),
+                status,
+                &json!({ "type": "error",
+                         "error": { "type": "api_error", "message": msg } }),
+            );
+        }
 
         let stream = ctype.as_deref().unwrap_or("").to_ascii_lowercase().contains("event-stream");
         let mut up: Option<String> = None;
@@ -2125,6 +2360,25 @@ fn handle_external(
                 && (ended || !ct_lower.contains("event-stream")
                     || txt.contains("\"error\"") || txt.contains("\"code\""))
             {
+                let ecode = peek_code(&head);
+                if ecode == "3012" {
+                    if let Some(cv) = conv {
+                        gw.block_conv(cv);
+                        crate::flowlog::log("relay", "conv-blocked", &format!("{} 200体3012 → 该对话永久拒绝", c.name));
+                    }
+                    crate::usage::append(&usage_path, &mk(&c.name, 405, "3012", tried, false, tried_at));
+                    return reply_json(
+                        slot.take().unwrap(),
+                        405,
+                        &json!({ "type": "error",
+                                 "error": { "type": "rate_limit_error",
+                                            "message": "上游风控 3012：这条对话已被拉黑，换号也无法恢复。请开一条新对话。" } }),
+                    );
+                }
+                if ecode == "1005" {
+                    // 该号对这个模型额度耗尽：打标 → 下一次选号此对话才会正确地推进到第二个号。
+                    gw.mark_no_quota(&c.id, &model);
+                }
                 let short: String = String::from_utf8_lossy(&head).chars().take(200).collect();
                 crate::flowlog::log("relay", "abnormal",
                     &format!("外部 {} ctype={ct_lower} 响应不像模型流，换下一个：{short}", c.name));
@@ -2134,6 +2388,14 @@ fn handle_external(
             reader = Box::new(std::io::Cursor::new(head).chain(reader));
         }
         gw.set_sticky(&c.id);
+        // 成功即绑定：对话钉在当前号上；新号绑定时落盘（重启不丢 → 不会产生"第二次换号"）。
+        if let Some(cv) = conv {
+            if gw.bind_account(cv, &c.id) {
+                let used = gw.conv_history(cv).len();
+                crate::flowlog::log("relay", "conv-bind", &format!("对话绑定 → {}（该对话已用 {used} 个号）", c.name));
+                gw.save_bindings(paths);
+            }
+        }
         {
             let mut g = gw.inner.lock().unwrap();
             g.served += 1;
@@ -2507,6 +2769,13 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
                 let n = gw.unfreeze(id);
                 crate::flowlog::log("relay", "unfreeze", &format!("{id} 清了 {n} 条标记"));
             }
+            return reply_json(req, 200, &gw.console_status(&paths));
+        }
+
+        // 逃生口：清空全部对话→账号绑定 + 3012 冷却表（误杀/需要重来时用）。
+        "/proxy/reset-conv" => {
+            let n = gw.reset_conv_bindings(&paths);
+            crate::flowlog::log("relay", "reset-conv", &format!("清了 {n} 条对话绑定/冷却"));
             return reply_json(req, 200, &gw.console_status(&paths));
         }
 
@@ -3053,6 +3322,38 @@ mod tests {
         assert!(gw.earliest_block().is_some());
         assert!(gw.inner.lock().unwrap().blocked.remove("x").is_some());
         assert_eq!(gw.earliest_block(), None);
+    }
+
+    #[test]
+    fn conversation_fingerprint_stable_across_turns() {
+        // 同一条对话（开场轮 messages[0] 不变）跨轮次必须得到同一指纹，否则绑不住号。
+        let t1 = r#"{"model":"GLM-5.3","messages":[{"role":"user","content":"开场"}]}"#;
+        let t2 = r#"{"model":"GLM-5.3","messages":[{"role":"user","content":"开场"},{"role":"assistant","content":"答"},{"role":"user","content":"再问"}]}"#;
+        let f1 = conversation_fingerprint(t1.as_bytes());
+        assert_eq!(f1, conversation_fingerprint(t2.as_bytes()), "同一开场应指纹相同");
+        assert!(f1.is_some());
+        // 不同开场 → 不同对话
+        let other = r#"{"model":"GLM-5.3","messages":[{"role":"user","content":"别的"}]}"#;
+        assert_ne!(f1.unwrap(), conversation_fingerprint(other.as_bytes()).unwrap());
+        // 换模型但同开场 → 仍同指纹（模型不进指纹，防按模型分叉推 >2 号）
+        let sw = r#"{"model":"GLM-5.3-Flash","messages":[{"role":"user","content":"开场"}]}"#;
+        assert_eq!(f1.unwrap(), conversation_fingerprint(sw.as_bytes()).unwrap());
+        // 无 messages / 非 JSON → None（不绑、走老路径）
+        assert!(conversation_fingerprint(b"{}".as_slice()).is_none());
+        assert!(conversation_fingerprint(b"not json".as_slice()).is_none());
+    }
+
+    #[test]
+    fn bind_account_caps_at_two_and_reports_changed() {
+        let gw = Gateway::default();
+        let cv = 42u64;
+        assert_eq!(gw.bound_account(cv), None);
+        assert!(gw.bind_account(cv, "a"), "首次绑定应报 changed");
+        assert!(!gw.bind_account(cv, "a"), "重复绑定同一号不应报 changed");
+        assert!(gw.bind_account(cv, "b"));
+        assert_eq!(gw.bound_account(cv).as_deref(), Some("b"), "绑定号是当前（最后）号");
+        // 上限语义：conv_used 已 2 个号 → at_bind_cap 路径据此拒绝推第 3 个
+        assert_eq!(gw.conv_history(cv).len(), 2);
     }
 }
 

@@ -19,6 +19,13 @@ const IDENTITY_PREFIX: &str = "You are an interactive ZCode agent";
 
 const OVERRIDE_NAME: &str = "system_prompt.json";
 
+/// 内嵌兜底（手机端 503 修复）：Android 上没有 ZCode 桌面安装，extract_from_zcode 永远失败，
+/// 每条 relay 都 503。这份文件是从 PC 端成功抽取后缓存的 system_prompt.json（2 块、
+/// validate() 通过、与 zcode.cjs 里的身份段逐字节一致）——编译期嵌进二进制，作为
+/// 「覆盖文件 → zcode.cjs 抽取」之后的最后一级。落盘成覆盖文件，用户之后仍可手动替换。
+/// 注意：ZCode 升级改身份段时这份会过期（上游 3012）——重新从 PC 抽一份覆盖即可。
+const EMBEDDED_FALLBACK: &str = include_str!("system_prompt_fallback.json");
+
 pub fn system_blocks(paths: &Paths) -> Result<Vec<Value>, String> {
     let override_path = paths.store_dir().join(OVERRIDE_NAME);
 
@@ -43,13 +50,29 @@ pub fn system_blocks(paths: &Paths) -> Result<Vec<Value>, String> {
             }
             Ok(b)
         }
-        Err(e) => Err(format!(
-            "无法取得 ZCode 系统提示词：{e}\n\
-             请确认本机已安装 ZCode 客户端（或在设置里指定 ZCode.exe 路径，\
-             需要的是其同目录下的 resources/glm/zcode.cjs）；\
-             也可以手动放一份覆盖文件：{}",
-            override_path.display()
-        )),
+        Err(e) => {
+            // 兜底（手机端）：本机没有 ZCode 可抽时用内嵌快照，并落盘成覆盖文件——
+            // 之后的行为与手动放置完全一致（可读、可改、可删回退）。
+            if let Some(b) = serde_json::from_str::<Value>(EMBEDDED_FALLBACK)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+            {
+                if validate(&b).is_ok() {
+                    eprintln!("[prompt] 本机无 ZCode（{e}），使用内嵌系统提示词兜底");
+                    if let Ok(s) = serde_json::to_string(&Value::Array(b.clone())) {
+                        let _ = cache_write(&override_path, &s);
+                    }
+                    return Ok(b);
+                }
+            }
+            Err(format!(
+                "无法取得 ZCode 系统提示词：{e}\n\
+                 请确认本机已安装 ZCode 客户端（或在设置里指定 ZCode.exe 路径，\
+                 需要的是其同目录下的 resources/glm/zcode.cjs）；\
+                 也可以手动放一份覆盖文件：{}",
+                override_path.display()
+            ))
+        }
     }
 }
 
