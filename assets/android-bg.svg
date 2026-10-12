@@ -1,0 +1,10 @@
+<!-- 自适应背景：与桌面图标同源的深蓝渐变（全幅，被蒙版裁成任何形状都自然） -->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="surface" x1="64" y1="24" x2="448" y2="496" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#253D64"/>
+      <stop offset="1" stop-color="#101C32"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#surface)"/>
+</svg>

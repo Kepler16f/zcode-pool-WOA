@@ -1,0 +1,14 @@
+<!-- 自适应前景：Z 字形 + 偏移层，画在 512 视口中央、占 ~62% —— 圆形/圆角/方形蒙版都裁不到内容 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="layer" x1="205" y1="230" x2="390" y2="400" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6CB9FF"/>
+      <stop offset="1" stop-color="#417FEF"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(78 60) scale(0.695)">
+    <path d="M408 224V356C408 384.719 384.719 408 356 408H224" stroke="url(#layer)" stroke-width="24" stroke-linecap="round"/>
+    <path d="M128 124H364V176L208 308H364V364H128V312L284 180H128V124Z" fill="#F0F6FF"/>
+    <path d="M208 308H364V364H142L208 308Z" fill="#89BDFF"/>
+  </g>
+</svg>
