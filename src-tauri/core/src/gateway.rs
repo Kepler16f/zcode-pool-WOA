@@ -12,9 +12,10 @@ pub const DEFAULT_PORT: u16 = 8899;
 const SWITCH_STATUS: [u16; 4] = [401, 402, 403, 429];
 const MAX_TRIES: usize = 4;
 
-/// 上游 3012 实测阈值：一条对话被「超过 2 个账号」服务过就永久拉黑（v0.2.0 release 说明）。
-/// 绑定推进上限取 2：第 1 号额度耗尽可换第 2 号，再耗尽就不再换（换=踩雷），报提示开新对话。
-const MAX_CONV_ACCOUNTS: usize = 2;
+/// 对话绑定历史里最多记多少个"用过的号"（纯内存裁剪，不是切换上限）。
+/// 绑定不硬顶号数：绑定号额度耗尽照常推进下一个（见 handle_external 选号循环）；
+/// 若推进到某号真触发上游 3012，则整条对话进冷却、不再吃任何号 —— 由上游判定保护池子。
+const CONV_HISTORY_CAP: usize = 8;
 /// 对话绑定与 3012 黑名单的 TTL / 条数上限（LRU 淘汰，防长会话积累）。
 const CONV_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// 3012 对话的本地冷却。上游说「同对话 >2 号永久拉黑」，但实测新对话也会 3012
@@ -256,18 +257,18 @@ struct Inner {
     /// 注意与上面取码池的 `inflight`（Vec）无关。
     busy: HashMap<String, u32>,
 
-    /// 对话 → 绑定账号（3012 风控对策）。上游实测：**同一条对话被超过 2 个账号服务过**
-    /// 就触发风控（3012），此后这条对话用任何号都过不去 —— 而默认的换号策略恰恰会在
-    /// 429/额度尽时把一条对话接力给下一个号，等于主动踩雷。这里给每条对话钉一个号：
-    /// 除非这个号对该模型真的没额度了（candidates 里没有它）才解绑换号，其余错误
-    /// （429/网络抖动/3012）都等原号，不换。绑定最多推进 2 个号（第 3 个号 = 上游雷区）。
-    /// conv_bindings 会被 persist_bindings 落盘（重启不丢绑定 → 不产生“第二次换号”）。
+    /// 对话 → 绑定账号（3012 风控对策）。上游实测：同一条对话被多个账号接力服务容易触发
+    /// 3012（此后该对话换任何号都过不去），而默认换号策略恰恰会在 429/额度尽时把一条对话
+    /// 接力给下一个号，等于主动踩雷。这里给每条对话钉一个号：只有当绑定号对该模型真的没
+    /// 额度了（不在 candidates 里）才解绑推进下一个号，其余错误（429/网络抖动）都等原号不换。
+    /// 不设推进硬顶 —— 两个号都耗尽照样换下一个；真撞到 3012 则由 conv_blocked 冷却兜底。
+    /// conv_bindings 会被 save_bindings 落盘（重启不丢绑定 → 不会因重启而“第二次换号”）。
     conv_bindings: HashMap<u64, ConvBinding>,
     /// 被 3012 判过的对话指纹：命中直接拒，不再拿任何号去喂（保护整个池）。
     conv_blocked: HashMap<u64, u64>,
 }
 
-/// 一条对话用过的账号（按先后），最多 MAX_CONV_ACCOUNTS 个。
+/// 一条对话用过的账号（按先后，最后一个是当前绑定号）。历史裁剪到 CONV_HISTORY_CAP。
 #[derive(Default)]
 struct ConvBinding {
     accounts: Vec<String>,
@@ -1427,7 +1428,7 @@ impl Gateway {
         self.inner.lock().unwrap().conv_bindings.get(&conv).map(|b| b.accounts.clone()).unwrap_or_default()
     }
 
-    /// 把账号推进/登记为对话绑定（追加，上限 MAX_CONV_ACCOUNTS）。返回是否新增。
+    /// 把账号推进/登记为对话绑定（追加，历史裁剪到 CONV_HISTORY_CAP）。返回是否新增。
     fn bind_account(&self, conv: u64, id: &str) -> bool {
         let mut g = self.inner.lock().unwrap();
         let now = now_ms();
@@ -1435,6 +1436,10 @@ impl Gateway {
         let changed = !b.accounts.iter().any(|x| x == id);
         if changed {
             b.accounts.push(id.to_string());
+            if b.accounts.len() > CONV_HISTORY_CAP {
+                let cut = b.accounts.len() - CONV_HISTORY_CAP;
+                b.accounts.drain(..cut);
+            }
         }
         b.last_seen = now;
         changed
@@ -2125,11 +2130,9 @@ fn handle_external(
     // 每 6~7 秒重连一次，秒回 502 等于把这些重连全变成无谓往返（客户端一直「等待重连」）。
     // 这里挂起到最近的解冻时刻再重选一轮（总等待 ≤ RATE_WAIT_MS），解冻即恢复服务。
     const RATE_WAIT_MS: u64 = 45_000;
-    // 对话绑定的号（若有）：候选里有它 → 只发它（不串号）；没有它（该号对所有模型都没
-    // 额度了）且已用号数 < 上限 → 允许推进一个新号；已用号数达上限还不绑不到 → 不越界。
+    // 对话绑定的号（若有）：候选里有它 → 只发它（不串号）；它 429/冷却 → 挂起等它解冻；
+    // 只有它对该模型真没额度了（掉出 candidates）才推进下一个号。不设硬顶，见选号循环。
     let bound = conv.and_then(|c| gw.bound_account(c));
-    let conv_used = conv.map(|c| gw.conv_history(c).len()).unwrap_or(0);
-    let at_bind_cap = conv.map(|_| conv_used >= MAX_CONV_ACCOUNTS).unwrap_or(false);
     let pick = |mdl: &str| -> (String, Vec<Candidate>) {
         let mut m = mdl.to_string();
         let mut c = gw.idle_first(gw.sticky_order(gw.candidates(paths, &m)));
@@ -2150,25 +2153,15 @@ fn handle_external(
     let mut waited_ms = 0u64;
     let (model, cands) = loop {
         let (m, mut c) = pick(&model);
-        // 对话绑定（「除非额度用完不然不切换」的硬形态）：
+        // 对话绑定（「除非额度用完不然不切换」）：
         // · 绑定号有额度（在本轮候选里）→ 只发它，别的号一个不碰
-        // · 绑定号在 429/冷却 → 清空候选，走下面的等待挂起，等它解冻（限流 ≠ 额度用完，不换号）
-        // · 绑定号掉出候选（该模型额度尽）→ 未到 2 号上限则保留其他候选、本轮推进新号
-        //   （成功即 bind 推进绑定）；已到上限 → 503 明确提示（第 3 个号 = 3012 雷区，不越界）
+        // · 绑定号在 429/冷却 → 清空候选走下面的等待挂起，等它解冻（限流 ≠ 额度用完，不换号）
+        // · 绑定号掉出候选（额度真尽）→ 本轮照常推进下一个号（成功后绑定随之迁移）
         if let Some(bid) = &bound {
             if c.iter().any(|x| &x.id == bid) {
                 c.retain(|x| &x.id == bid);
             } else if gw.is_blocked(bid) {
                 c.clear();
-            } else if at_bind_cap {
-                crate::usage::append(&usage_path, &mk("", 503, "conv-exhausted", 0, false, now_ms()));
-                return reply_json(
-                    slot.take().unwrap(),
-                    503,
-                    &json!({ "type": "error",
-                             "error": { "type": "overloaded_error",
-                                        "message": format!("这条对话用过的 {conv_used} 个号额度都尽了。为避免触发风控（同对话 >2 号即被拉黑），不再自动换号——请开新对话，或给号池补充额度。") } }),
-                );
             }
         }
         if !c.is_empty() {
@@ -3362,16 +3355,17 @@ mod tests {
     }
 
     #[test]
-    fn bind_account_caps_at_two_and_reports_changed() {
+    fn bind_account_tracks_latest_and_reports_changed() {
         let gw = Gateway::default();
         let cv = 42u64;
         assert_eq!(gw.bound_account(cv), None);
         assert!(gw.bind_account(cv, "a"), "首次绑定应报 changed");
         assert!(!gw.bind_account(cv, "a"), "重复绑定同一号不应报 changed");
+        // 额度耗尽时照常推进下一个号（无硬上限），绑定号始终 = 最后推进的那个
         assert!(gw.bind_account(cv, "b"));
-        assert_eq!(gw.bound_account(cv).as_deref(), Some("b"), "绑定号是当前（最后）号");
-        // 上限语义：conv_used 已 2 个号 → at_bind_cap 路径据此拒绝推第 3 个
-        assert_eq!(gw.conv_history(cv).len(), 2);
+        assert!(gw.bind_account(cv, "c"));
+        assert_eq!(gw.bound_account(cv).as_deref(), Some("c"), "绑定号是当前（最后）号");
+        assert_eq!(gw.conv_history(cv), vec!["a", "b", "c"]);
     }
 }
 

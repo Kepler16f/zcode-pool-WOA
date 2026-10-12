@@ -1,8 +1,9 @@
 import { execSync } from "node:child_process";
 import {
   closeSync, copyFileSync, existsSync, mkdirSync, openSync,
-  readdirSync, readFileSync, readSync, statSync,
+  readdirSync, readFileSync, readSync, rmSync, statSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -65,10 +66,37 @@ console.log(`[dist] ✓ 产物架构  ${arch}（${isCross ? "交叉构建" : "�
 
 const outDir = join(root, "release");
 mkdirSync(outDir, { recursive: true });
+// 每次构建先清掉【同类型】的上一次产物（exe 构建只清 exe，安卓 APK 由 fetch-android.mjs 管），
+// 保证 release/ 与下载文件夹里同一形态永远只有最新一版，不会新旧混着装错。
+for (const f of readdirSync(outDir)) {
+  if (/^zcode-pool.*\.exe$/i.test(f)) {
+    rmSync(join(outDir, f), { force: true });
+    console.log(`[dist] ✓ 清旧产物  ${f}`);
+  }
+}
+// 下载文件夹同步：拷新的之前先删掉所有旧的 zcode-pool 安装包（用户要求：只留最新）。
+const downloads = join(homedir(), "Downloads");
+const syncToDownloads = (path) => {
+  if (!existsSync(downloads)) return;
+  try {
+    for (const f of readdirSync(downloads)) {
+      if (f !== basename(path) && /^zcode-pool.*setup.*\.exe$/i.test(f)) {
+        rmSync(join(downloads, f), { force: true });
+        console.log(`[dist] ✓ 清下载文件夹旧包  ${f}`);
+      }
+    }
+    const dst = join(downloads, basename(path));
+    if (existsSync(dst)) rmSync(dst, { force: true });
+    copyFileSync(path, dst);
+    console.log(`[dist] ✓ 已同步下载文件夹  ${basename(dst)}`);
+  } catch (e) {
+    console.log(`[dist] ! 同步下载文件夹失败（${e.message}），产物仍在 ${outDir}`);
+  }
+};
 const archSuffix = arch === "x64" ? "" : `_${arch}`;
 const portable = join(outDir, `zcode-pool_${ver}_portable${archSuffix}.exe`);
 copyFileSync(rawExe, portable);
-console.log(`[dist] ✓ 便携版  ${basename(portable)}  (${mb(portable)} MB)`);
+console.log(`[dist] ✓ 便携版  ${basename(portable)}  (${mb(portable)} MB)`); // 便携版只留 release/，下载文件夹只同步安装包
 
 // NSIS 产物同样可能落在 target/release/bundle/nsis 或 target/<triple>/release/bundle/nsis，
 // 同版本可能同时存在多个架构的安装包，全部收集。
@@ -87,5 +115,6 @@ for (const dir of nsisDirs) {
 for (const [name, path] of [...setups].sort(([a], [b]) => a.localeCompare(b))) {
   copyFileSync(path, join(outDir, name));
   console.log(`[dist] ✓ 安装包  ${name}`);
+  syncToDownloads(join(outDir, name));
 }
 console.log(`[dist] 完成 → ${outDir}`);
