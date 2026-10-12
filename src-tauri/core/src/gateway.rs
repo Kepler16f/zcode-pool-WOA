@@ -2150,9 +2150,11 @@ fn handle_external(
     let mut waited_ms = 0u64;
     let (model, cands) = loop {
         let (m, mut c) = pick(&model);
-        // 对话绑定：绑定号仍在候选（对该模型有额度）→ 本轮只发它，绝不串号；
-        // 绑定号在冷却 → 清空候选走下面的等待（等原号解冻，不换）；
-        // 绑定号真没额度 → 未达上限则放开选新号（成功后 bind 推进），达上限则拒绝（换=踩雷）。
+        // 对话绑定（「除非额度用完不然不切换」的硬形态）：
+        // · 绑定号有额度（在本轮候选里）→ 只发它，别的号一个不碰
+        // · 绑定号在 429/冷却 → 清空候选，走下面的等待挂起，等它解冻（限流 ≠ 额度用完，不换号）
+        // · 绑定号掉出候选（该模型额度尽）→ 未到 2 号上限则保留其他候选、本轮推进新号
+        //   （成功即 bind 推进绑定）；已到上限 → 503 明确提示（第 3 个号 = 3012 雷区，不越界）
         if let Some(bid) = &bound {
             if c.iter().any(|x| &x.id == bid) {
                 c.retain(|x| &x.id == bid);
@@ -2291,15 +2293,31 @@ fn handle_external(
                 continue;
             }
         };
+        if status == 429 {
+            // 限流不是「额度用完」，不换号（同对话 >2 号 = 3012 雷区）。标冷却后把 429 连同
+            // Retry-After 透传给客户端，让它退避重试；下一次该号已在冷却表里，candidates 会
+            // 自动避开 → 天然换到别的号或等待，绝不在这一发里接力第二个号。
+            let ttl = block_ms(ra);
+            gw.mark_blocked(&c.id, ttl);
+            crate::usage::append(&usage_path, &mk(&c.name, 429, "429", tried, false, tried_at));
+            crate::flowlog::log("relay", "switch", &format!("外部 {} HTTP 429 → 冷却 {}ms，不换号透传", c.name, ttl));
+            let secs = (ttl / 1000).clamp(1, 60).to_string();
+            return reply_json_hdr(
+                slot.take().unwrap(),
+                429,
+                &[("Retry-After", &secs)],
+                &json!({ "type": "error",
+                         "error": { "type": "rate_limit_error",
+                                    "message": "该账号限流中（429），已冷却并暂缓，稍后自动改用其他号" } }),
+            );
+        }
         if SWITCH_STATUS.contains(&status) {
-            if status == 429 {
-                gw.mark_blocked(&c.id, block_ms(ra));
-            }
+            // 401/402/403：账号级失效（token/权限/额度类），对话并未被这个号真正服务，换下一个安全。
             let d = backoff_ms(tried);
             crate::flowlog::log(
                 "relay",
                 "switch",
-                &format!("外部 {} HTTP {status} → 冷却/换下一个（退避 {d}ms）", c.name),
+                &format!("外部 {} HTTP {status} → 换下一个（退避 {d}ms）", c.name),
             );
             std::thread::sleep(Duration::from_millis(d));
             continue;
