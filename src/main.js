@@ -30,6 +30,59 @@ let relay = { running: false, port: 0, served: 0, switched: 0, clientAccount: nu
 // 万一上游改回去：把下面这段恢复，并在 gateway.rs 的 handle_external 里重新调 take_param()。
 function syncMintFrame(_on) {}
 let tab = "mailbox";
+
+// ── Web 控制台内嵌层 ──────────────────────────────────────────────
+// 「proxy → 对外接口」那个 /proxy 控制台（仪表盘/渠道/使用记录/账号/邮箱/设置/日志）
+// 直接嵌进主界面，用侧边栏「控制台」按钮打开。
+// iframe 作为 document.body 里的常驻覆盖层：render() 每次重建 $app 都不碰它，
+// 只在标签切换时切 display（display:none 不会重载 iframe），并对齐 .content 的实际矩形
+// （自适应侧栏宽度变化，无需知道 CSS 常量）。绝不在 render 中移动 iframe 节点 ——
+// 重新插入已脱离 DOM 的 iframe 会触发重载，切标签就闪一下等于没内嵌。
+let consoleOverlay = null;
+let consoleFrame = null;
+let consolePort = 0;
+function consoleBase() {
+  return `http://127.0.0.1:${consolePort || relay.port || relay.defaultPort || 8899}`;
+}
+function ensureConsoleOverlay() {
+  if (consoleOverlay) return;
+  const port = relay.port || relay.defaultPort || 8899;
+  consolePort = port;
+  consoleOverlay = document.createElement("div");
+  consoleOverlay.className = "console-overlay";
+  consoleFrame = document.createElement("iframe");
+  consoleFrame.className = "console-frame";
+  consoleFrame.setAttribute("title", t("con.frameTitle"));
+  consoleFrame.src = `${consoleBase()}/proxy`;
+  consoleOverlay.appendChild(consoleFrame);
+  document.body.appendChild(consoleOverlay);
+}
+// render 末尾调用：显示则对齐内容区，隐藏则留着 iframe 不重载。
+function syncConsoleOverlay() {
+  const on = tab === "console";
+  if (!on) {
+    if (consoleOverlay) consoleOverlay.style.display = "none";
+    return;
+  }
+  ensureConsoleOverlay();
+  const slot = $app.querySelector(".console-slot");
+  if (slot) {
+    const r = slot.getBoundingClientRect();
+    Object.assign(consoleOverlay.style, {
+      display: "block",
+      left: `${r.left}px`,
+      top: `${r.top}px`,
+      width: `${r.width}px`,
+      height: `${r.height}px`,
+    });
+  }
+  // 端口变更（改过反代端口/重启换了回落端口）→ 只有这时候才允许重载一次 iframe。
+  const want = relay.port || relay.defaultPort || 8899;
+  if (want && want !== consolePort) {
+    consolePort = want;
+    consoleFrame.src = `${consoleBase()}/proxy`;
+  }
+}
 const REFRESH_CLAIM_COOLDOWN_MS = 60_000;
 let refreshClaim = { running: false, done: 0, total: 0, cooldownUntil: 0 };
 let refreshTicker = null;
@@ -413,12 +466,23 @@ const actions = {
   },
   async relayConsole() {
     await guard(async () => {
-
+      // 内嵌打开：确保反代开着（iframe 才有东西可加载），然后切到控制台标签。
+      if (!relay.external) relay = await invoke("relay_external", { on: true });
+      tab = "console";
+      render();
+    });
+  },
+  async relayConsoleExternal() {
+    await guard(async () => {
       if (!relay.external) relay = await invoke("relay_external", { on: true });
       const port = relay.port || relay.defaultPort || 8899;
       render();
       await invoke("open_external", { url: `http://127.0.0.1:${port}/proxy` });
     });
+  },
+  reloadConsole() {
+    // 只重载 iframe 本身（反代重启/端口换过后想立刻看新状态时用），不碰页面结构。
+    if (consoleFrame) consoleFrame.src = `${consoleBase()}/proxy`;
   },
 
   async setLang(l) {
@@ -1387,6 +1451,9 @@ function render() {
         <button class="nav-item${tab === "proxy" ? " on" : ""}" aria-current="${tab === "proxy" ? "page" : "false"}" click="actions.setTab('proxy')">
           ${ic("swap", 17)} ${t("p.nav")}
         </button>
+        <button class="nav-item${tab === "console" ? " on" : ""}" aria-current="${tab === "console" ? "page" : "false"}" click="actions.relayConsole()">
+          ${ic("gauge", 17)} ${t("con.nav")}
+        </button>
       </nav>
       <div class="nav-spacer"></div>
       <div class="side-footer">
@@ -1408,6 +1475,16 @@ function render() {
     body = settingsView(s);
   } else if (tab === "proxy") {
     body = proxyView();
+  } else if (tab === "console") {
+    body = `
+      <div class="content-h">
+        <h1>${t("con.title")}</h1>
+        <span class="sub"><span class="dot${relay.external ? " on" : ""}"></span>${relay.external ? t("r.stateOn") : t("r.stateOff")}</span>
+        <span class="spacer"></span>
+        <button class="btn-ghost has-ic" click="actions.reloadConsole()" title="${t("con.reloadTip")}">${ic("refresh", 15)} ${t("con.reload")}</button>
+        <button class="btn-ghost has-ic" click="actions.relayConsoleExternal()" title="${t("con.openExtTip")}">${ic("export", 15)} ${t("con.openExt")}</button>
+      </div>
+      <div class="console-slot"></div>`;
   } else {
     const listHtml = listHtmlFor(s, filteredAccounts(s));
     const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
@@ -1452,6 +1529,7 @@ function render() {
 
   $app.innerHTML = `<div class="shell">${sidebar}<div class="content page-${tab}">${body}</div></div>`;
   restoreScroll(scrollCap);
+  syncConsoleOverlay();
 }
 
 window.actions = actions;
@@ -1570,6 +1648,9 @@ listen("oauth://done", (ev) => {
 listen("state-changed", () => {
   refresh().then(() => { if (!uiLocked() && !isEditing()) render(); }).catch(() => {});
 });
+
+// 覆盖层是 fixed 定位：窗口尺寸/侧栏折叠（媒体查询）变了要对齐一次。
+window.addEventListener("resize", () => { if (tab === "console") syncConsoleOverlay(); });
 
 const SWEEP_PERIOD = 10 * 60 * 1000;
 const SWEEP_JITTER = 0.2;
