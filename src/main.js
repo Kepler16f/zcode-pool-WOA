@@ -1448,11 +1448,11 @@ function render() {
         <button class="nav-item${tab === "accounts" ? " on" : ""}" aria-current="${tab === "accounts" ? "page" : "false"}" click="actions.setTab('accounts')">
           ${ic("person", 17)} ${t("m.tab.accounts")}${s.accounts.length ? `<span class="badge">${s.accounts.length}</span>` : ""}
         </button>
-        <button class="nav-item${tab === "proxy" ? " on" : ""}" aria-current="${tab === "proxy" ? "page" : "false"}" click="actions.setTab('proxy')">
-          ${ic("swap", 17)} ${t("p.nav")}
-        </button>
         <button class="nav-item${tab === "console" ? " on" : ""}" aria-current="${tab === "console" ? "page" : "false"}" click="actions.relayConsole()">
           ${ic("gauge", 17)} ${t("con.nav")}
+        </button>
+        <button class="nav-item${tab === "proxy" ? " on" : ""}" aria-current="${tab === "proxy" ? "page" : "false"}" click="actions.setTab('proxy')">
+          ${ic("swap", 17)} ${t("p.nav")}
         </button>
       </nav>
       <div class="nav-spacer"></div>
