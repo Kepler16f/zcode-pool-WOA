@@ -10,6 +10,7 @@ pub mod gateway;
 pub mod graph;
 pub mod i18n;
 pub mod oauth;
+pub mod openai;
 pub mod pool;
 pub mod prompt;
 pub mod quota;

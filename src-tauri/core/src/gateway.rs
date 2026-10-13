@@ -1886,7 +1886,7 @@ fn norm_path(url: &str) -> String {
     while let Some(rest) = s.strip_prefix("/v1/v1") {
         s = rest.to_string();
     }
-    if s.starts_with("/messages") || s.starts_with("/count_tokens") {
+    if s.starts_with("/messages") || s.starts_with("/count_tokens") || s.starts_with("/chat/completions") {
         s = format!("/v1{s}");
     }
     s
@@ -2126,6 +2126,30 @@ fn handle_external(
                                 "message": "对外接口没开 —— 到工具的「反代」页打开它" } }),
         );
     }
+
+    // OpenAI 兼容：/v1/chat/completions → 请求转 Anthropic、上游打 /v1/messages、
+    // 响应转回 chat.completion（流式为 chunk SSE）。错误回复保持 Anthropic 形
+    // （OpenAI SDK 也能显示 error.message），细节见 openai.rs 头注释。
+    let is_openai = path.ends_with("/chat/completions");
+    let oai_req: Vec<u8>;
+    let body: &[u8] = if is_openai {
+        match crate::openai::body_to_anthropic(body) {
+            Ok(v) => {
+                oai_req = v.to_string().into_bytes();
+                &oai_req
+            }
+            Err(e) => {
+                return reply_json(
+                    slot.take().unwrap(),
+                    400,
+                    &json!({ "error": { "message": e } }),
+                )
+            }
+        }
+    } else {
+        body
+    };
+
     let mut model = body_model(body).unwrap_or_else(|| EXTERNAL_MODELS[0].to_string());
 
     let client_model = model.clone();
@@ -2176,7 +2200,12 @@ fn handle_external(
             key: key_tag.to_string(),
         }
     };
-    let target = format!("{UPSTREAM}{path}");
+    // OpenAI 请求已转成 Anthropic，上游端点固定 /v1/messages（Anthropic 网关只认这个）。
+    let target = if is_openai {
+        format!("{UPSTREAM}/v1/messages")
+    } else {
+        format!("{UPSTREAM}{path}")
+    };
     let proxy_url = gw.inner.lock().unwrap().relay_proxy.clone();
     let mut ab = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(15))
@@ -2553,6 +2582,22 @@ fn handle_external(
             }),
             path: usage_path.clone(),
         });
+        // OpenAI 出口：非流式读尽 Meter（EOF 自动落 usage）后把 Anthropic JSON 整体转
+        // chat.completion；流式把 StreamTee 套在 Meter 外层 —— 用量仍从原始 Anthropic
+        // 事件里数（Meter 不动），只有出给客户端的字节流被翻成 chunk SSE。
+        if is_openai && !stream {
+            let mut buf = Vec::new();
+            let _ = (&mut { reader }).read_to_end(&mut buf);
+            let converted = serde_json::from_slice::<Value>(&buf)
+                .map(|v| crate::openai::resp_to_openai(&v))
+                .unwrap_or_else(|_| json!({ "error": { "message": "上游非流式响应不是合法 JSON" } }));
+            return reply_json(slot.take().unwrap(), status, &converted);
+        }
+        let reader: Box<dyn std::io::Read + Send> = if is_openai {
+            Box::new(crate::openai::StreamTee::new(reader))
+        } else {
+            reader
+        };
         let mut resp =
             tiny_http::Response::new(tiny_http::StatusCode(status), hs, reader, None, None);
         for h in cors_headers() {
