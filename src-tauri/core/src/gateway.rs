@@ -445,7 +445,85 @@ impl Gateway {
             "quotaTotal": g.quota_total,
             "quotaFailed": g.last_failed.clone(),
             "lastRefresh": g.last_refresh.clone(),
+            "convBindings": g.conv_bindings.len(),
+            "convCooling": g.conv_blocked.values().filter(|t| **t > now).count(),
         })
+    }
+
+    /// 使用记录（含筛选）：`/proxy/usage` 路由与原生控制台的 console_usage 命令共用一份逻辑。
+    pub fn console_usage(&self, paths: &Paths, acct: &str, model: &str, key: &str, ok: &str, limit: usize) -> Value {
+        let (acct, model, key) = (acct.to_lowercase(), model.to_lowercase(), key.to_lowercase());
+        let limit = limit.min(1000);
+        let rows = crate::usage::read_all(&crate::usage::path_for(&paths.store_dir()));
+        let total = rows.len();
+        let out: Vec<Value> = rows
+            .iter()
+            .rev()
+            .filter(|r| acct.is_empty() || r.acct.to_lowercase() == acct)
+            .filter(|r| {
+                model.is_empty()
+                    || r.model.to_lowercase() == model
+                    || r.up.as_deref().map(|u| u.to_lowercase() == model).unwrap_or(false)
+            })
+            .filter(|r| key.is_empty() || r.key.to_lowercase() == key)
+            .filter(|r| match ok {
+                "1" | "true" | "ok" => !crate::usage::is_fail(r),
+                "0" | "false" | "fail" => crate::usage::is_fail(r),
+                _ => true,
+            })
+            .take(limit)
+            .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
+            .collect();
+        let count = out.len();
+        json!({ "rows": out, "count": count, "total": total,
+                "stats": crate::usage::stats(&crate::usage::path_for(&paths.store_dir())) })
+    }
+
+    pub fn console_logs(&self, offset: usize, limit: usize) -> Value {
+        let limit = limit.max(1).min(500);
+        let (lines, total) = crate::flowlog::tail_page(offset, limit);
+        json!({ "lines": lines, "total": total, "offset": offset, "limit": limit })
+    }
+
+    /// 探测（单号或全池，上限 30 防手滑）：probe 路由与原生命令共用。
+    pub fn probe_all(&self, paths: &Paths, one: Option<String>) -> Value {
+        let ids: Vec<String> = match one {
+            Some(id) => vec![id],
+            None => store::list_accounts(paths).unwrap_or_default().into_iter().map(|a| a.id).collect(),
+        };
+        let mut res = vec![];
+        for id in ids.iter().take(30) {
+            let r = self.probe_one(paths, id);
+            res.push(json!({ "id": id, "ok": r.is_ok(), "ms": r.as_ref().ok(), "err": r.err() }));
+        }
+        json!({ "results": res, "status": self.console_status(paths) })
+    }
+
+    /// 出站代理（空 = 直连）；与路由共用：校验 → 落盘 → 热更新 → 记日志。
+    pub fn set_relay_proxy(&self, paths: &Paths, url: &str) -> Result<Value, String> {
+        let url = url.trim().to_string();
+        if !url.is_empty() {
+            crate::oauth::parse_proxy_url(&url)?;
+        }
+        store::set_relay_proxy(paths, &url)?;
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.relay_proxy = if url.is_empty() { None } else { Some(url.clone()) };
+        }
+        crate::flowlog::log("relay", "proxy-set", if url.is_empty() { "直连" } else { &url });
+        Ok(self.console_status(paths))
+    }
+
+    /// 删除 API Key；LAN 模式下最后一个 key 不许删（否则自己锁在门外）。
+    pub fn remove_key(&self, paths: &Paths, key: &str) -> Result<Value, String> {
+        let g = self.inner.lock().unwrap();
+        let in_use = !g.bind.starts_with("127.");
+        if in_use && g.keys.len() <= 1 {
+            return Err("现在是局域网模式，删掉最后一个 key 会让人进不来（先把监听地址改回 127.0.0.1）".into());
+        }
+        drop(g);
+        self.key_del(paths, key)?;
+        Ok(self.console_status(paths))
     }
 
     pub fn status(&self, paths: &Paths) -> Value {
@@ -606,7 +684,7 @@ impl Gateway {
         store::list_accounts(paths).map(|a| !a.is_empty()).unwrap_or(false)
     }
 
-    fn probe_one(&self, paths: &Paths, id: &str) -> Result<u64, String> {
+    pub fn probe_one(&self, paths: &Paths, id: &str) -> Result<u64, String> {
         let secret = crate::zcrypto::default_secret(&paths.home);
         let acc = store::load_account(paths, id)?;
         let tokens = crate::quota::candidate_tokens(&acc.credentials, acc.config.as_ref(), &secret);
@@ -2647,34 +2725,19 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
         "/proxy/usage" => {
             let limit = query_param(&url, "limit")
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(200)
-                .min(1000);
-            let acct = query_param(&url, "acct").unwrap_or_default().to_lowercase();
-            let model = query_param(&url, "model").unwrap_or_default().to_lowercase();
-            let key = query_param(&url, "key").unwrap_or_default().to_lowercase();
-            let ok = query_param(&url, "ok").unwrap_or_default();
-            let rows = crate::usage::read_all(&crate::usage::path_for(&paths.store_dir()));
-            let total = rows.len();
-            let out: Vec<Value> = rows
-                .iter()
-                .rev()
-                .filter(|r| acct.is_empty() || r.acct.to_lowercase() == acct)
-                .filter(|r| {
-                    model.is_empty()
-                        || r.model.to_lowercase() == model
-                        || r.up.as_deref().map(|u| u.to_lowercase() == model).unwrap_or(false)
-                })
-                .filter(|r| key.is_empty() || r.key.to_lowercase() == key)
-                .filter(|r| match ok.as_str() {
-                    "1" | "true" | "ok" => !crate::usage::is_fail(r),
-                    "0" | "false" | "fail" => crate::usage::is_fail(r),
-                    _ => true,
-                })
-                .take(limit)
-                .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
-                .collect();
-            let count = out.len();
-            return reply_json(req, 200, &json!({ "rows": out, "count": count, "total": total }));
+                .unwrap_or(200);
+            return reply_json(
+                req,
+                200,
+                &gw.console_usage(
+                    &paths,
+                    &query_param(&url, "acct").unwrap_or_default(),
+                    &query_param(&url, "model").unwrap_or_default(),
+                    &query_param(&url, "key").unwrap_or_default(),
+                    &query_param(&url, "ok").unwrap_or_default(),
+                    limit,
+                ),
+            );
         }
         "/proxy/usage/stats" => {
             return reply_json(req, 200, &crate::usage::stats(&crate::usage::path_for(&paths.store_dir())));
@@ -2682,24 +2745,14 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
 
         "/proxy/logs" => {
             let offset = query_param(&url, "offset").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
-            let limit = query_param(&url, "limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(50).clamp(1, 500);
-            let (lines, total) = crate::flowlog::tail_page(offset, limit);
-            return reply_json(req, 200, &json!({ "lines": lines, "total": total, "offset": offset, "limit": limit }));
+            let limit = query_param(&url, "limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(50);
+            return reply_json(req, 200, &gw.console_logs(offset, limit));
         }
 
         "/proxy/probe" => {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             let one = v.get("id").and_then(|x| x.as_str()).map(str::to_string);
-            let ids: Vec<String> = match one {
-                Some(id) => vec![id],
-                None => store::list_accounts(&paths).unwrap_or_default().into_iter().map(|a| a.id).collect(),
-            };
-            let mut res = vec![];
-            for id in ids.iter().take(30) {
-                let r = gw.probe_one(&paths, id);
-                res.push(json!({ "id": id, "ok": r.is_ok(), "ms": r.as_ref().ok(), "err": r.err() }));
-            }
-            return reply_json(req, 200, &json!({ "results": res, "status": gw.console_status(&paths) }));
+            return reply_json(req, 200, &gw.probe_all(&paths, one));
         }
         "/proxy/bind" => {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
@@ -2723,12 +2776,8 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
         "/proxy/key-del" => {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             let k = v.get("key").and_then(|x| x.as_str()).unwrap_or("");
-            let in_use = !gw.inner.lock().unwrap().bind.starts_with("127.");
-            if in_use && gw.inner.lock().unwrap().keys.len() <= 1 {
-                return reply_json(req, 400, &json!({ "error": "现在是局域网模式，删掉最后一个 key 会让人进不来（先把监听地址改回 127.0.0.1）" }));
-            }
-            return match gw.key_del(&paths, k) {
-                Ok(_) => reply_json(req, 200, &gw.console_status(&paths)),
+            return match gw.remove_key(&paths, k) {
+                Ok(st) => reply_json(req, 200, &st),
                 Err(e) => reply_json(req, 400, &json!({ "error": e })),
             };
         }
@@ -2805,21 +2854,11 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
         // 反代出站的代理（空字符串 = 改回直连）
         "/proxy/proxy-url" => {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
-            let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-            if !url.is_empty() {
-                if let Err(e) = crate::oauth::parse_proxy_url(&url) {
-                    return reply_json(req, 400, &json!({ "error": e }));
-                }
-            }
-            if let Err(e) = store::set_relay_proxy(&paths, &url) {
-                return reply_json(req, 400, &json!({ "error": e }));
-            }
-            {
-                let mut g = gw.inner.lock().unwrap();
-                g.relay_proxy = if url.is_empty() { None } else { Some(url.clone()) };
-            }
-            crate::flowlog::log("relay", "proxy-set", &if url.is_empty() { "直连".into() } else { url });
-            return reply_json(req, 200, &gw.console_status(&paths));
+            let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("");
+            return match gw.set_relay_proxy(&paths, url) {
+                Ok(st) => reply_json(req, 200, &st),
+                Err(e) => reply_json(req, 400, &json!({ "error": e })),
+            };
         }
         "/proxy/model-mode" => {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));

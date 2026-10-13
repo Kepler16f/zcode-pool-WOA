@@ -1667,6 +1667,89 @@ async fn relay_external(on: bool) -> Result<Value, String> {
     relay().set_external_and_run(&Paths::detect(), on)
 }
 
+// ── 原生 Web 控制台（侧边栏「控制台」标签）──────────────────────────
+// 数据面：console_status 是全量快照；下面这些包一层给 iframe 之外的原生视图用。
+// 全部直接调 gateway 的共享方法，与 /proxy/* HTTP 路由同一份逻辑（不分叉）。
+
+#[tauri::command]
+async fn console_status() -> Result<Value, String> {
+    Ok(relay().console_status(&Paths::detect()))
+}
+
+#[tauri::command]
+async fn console_usage(acct: Option<String>, model: Option<String>, key: Option<String>, ok: Option<String>, limit: Option<usize>) -> Result<Value, String> {
+    Ok(relay().console_usage(
+        &Paths::detect(),
+        &acct.unwrap_or_default(),
+        &model.unwrap_or_default(),
+        &key.unwrap_or_default(),
+        &ok.unwrap_or_default(),
+        limit.unwrap_or(200),
+    ))
+}
+
+#[tauri::command]
+async fn console_logs(offset: Option<usize>, limit: Option<usize>) -> Result<Value, String> {
+    Ok(relay().console_logs(offset.unwrap_or(0), limit.unwrap_or(80)))
+}
+
+#[tauri::command]
+async fn console_probe(id: Option<String>) -> Result<Value, String> {
+    Ok(relay().probe_all(&Paths::detect(), id))
+}
+
+#[tauri::command]
+async fn console_port(port: u16) -> Result<Value, String> {
+    relay().set_port(&Paths::detect(), port)
+}
+
+#[tauri::command]
+async fn console_bind(bind: String) -> Result<Value, String> {
+    relay().set_bind(&Paths::detect(), &bind)
+}
+
+#[tauri::command]
+async fn console_key_add(want: Option<String>) -> Result<Value, String> {
+    let paths = Paths::detect();
+    let k = relay().key_add(&paths, &want.unwrap_or_default())?;
+    Ok(json!({ "key": k, "status": relay().console_status(&paths) }))
+}
+
+#[tauri::command]
+async fn console_key_del(key: String) -> Result<Value, String> {
+    relay().remove_key(&Paths::detect(), &key)
+}
+
+#[tauri::command]
+async fn console_proxy_url(url: String) -> Result<Value, String> {
+    relay().set_relay_proxy(&Paths::detect(), &url)
+}
+
+#[tauri::command]
+async fn console_model_map(from: String, to: String) -> Result<Value, String> {
+    relay().set_model_map(&Paths::detect(), &from, &to)
+}
+
+#[tauri::command]
+async fn console_unfreeze(id: String) -> Result<Value, String> {
+    relay().unfreeze(&id);
+    Ok(relay().console_status(&Paths::detect()))
+}
+
+#[tauri::command]
+async fn console_reset_conv() -> Result<Value, String> {
+    let paths = Paths::detect();
+    relay().reset_conv_bindings(&paths);
+    Ok(relay().console_status(&paths))
+}
+
+#[tauri::command]
+async fn console_refresh_quota() -> Result<Value, String> {
+    let paths = Paths::detect();
+    relay().refresh_quota(&paths, true)?;
+    Ok(relay().console_status(&paths))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -1743,6 +1826,19 @@ pub fn run() {
             relay_policy,
             relay_model_mode,
             relay_external,
+            console_status,
+            console_usage,
+            console_logs,
+            console_probe,
+            console_port,
+            console_bind,
+            console_key_add,
+            console_key_del,
+            console_proxy_url,
+            console_model_map,
+            console_unfreeze,
+            console_reset_conv,
+            console_refresh_quota,
             reveal_main,
         ])
         .on_window_event(|window, event| {

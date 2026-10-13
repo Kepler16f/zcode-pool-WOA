@@ -68,10 +68,22 @@ html, body {
 .loading { min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center; color: var(--label-3); font-size: 13px; }
 
 .shell { display: flex; height: 100vh; height: 100dvh; overflow: hidden; }
-/* 内嵌 Web 控制台：iframe 是 body 级常驻覆盖层（render 不重建它），对齐 .console-slot 的矩形 */
-.console-slot { flex: 1; min-height: 0; }
-.console-overlay { position: fixed; z-index: 58; display: none; background: var(--bg); }
-.console-frame { width: 100%; height: 100%; border: 0; background: var(--bg); color-scheme: dark; }
+/* 原生 Web 控制台（console.js）：全部用应用变量，深色自动一致 */
+.con-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 0 var(--page-pad) 18px; }
+.con-kpi { background: var(--card); border: 1px solid var(--sep); border-radius: var(--r-lg); padding: 12px 14px; }
+.con-kpi .k { font-size: 11.5px; color: var(--label-3); text-transform: uppercase; letter-spacing: .04em; }
+.con-kpi .v { font-size: 21px; font-weight: 650; color: var(--label); font-variant-numeric: tabular-nums; margin-top: 3px; }
+.con-grid { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 12.5px; padding: 6px 0; }
+.con-grid .k { color: var(--label-3); }
+.con-fbar { display: flex; gap: 8px; align-items: center; padding: 0 var(--page-pad) 10px; flex-wrap: wrap; }
+.con-f, .con-in { background: var(--bg-2); border: 1px solid var(--sep); color: var(--label); border-radius: var(--r-sm); padding: 6px 9px; font-size: 12.5px; font-family: inherit; }
+.con-in { min-width: 0; }
+.con-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.con-table th { text-align: left; color: var(--label-3); font-weight: 500; padding: 6px 10px; border-bottom: 1px solid var(--sep); position: sticky; top: 0; background: var(--bg); }
+.con-table td { padding: 5px 10px; border-bottom: 1px solid var(--sep-op); color: var(--label-2); white-space: nowrap; }
+.dim { color: var(--label-3); }
+.con-table tr:hover td { background: var(--bg-2); }
+.con-logs { margin: 0 var(--page-pad); padding: 12px 14px; background: var(--bg-2); border: 1px solid var(--sep); border-radius: var(--r); font-family: var(--mono); font-size: 11.5px; line-height: 1.7; color: var(--label-2); white-space: pre-wrap; word-break: break-all; max-height: calc(100vh - 210px); overflow: auto; }
 
 .sidebar {
   width: 208px; flex: none;
