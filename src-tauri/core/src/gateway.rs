@@ -37,6 +37,11 @@ const RATE_TTL_MS: u64 = 45_000;
 /// 与「被限流」区别对待 —— 网络错误不代表这个号超了并发/额度，不该锁满 45s。
 const NET_ERR_TTL_MS: u64 = 20_000;
 
+/// 「截断号」短冷却：流式响应没收到 message_stop 就 EOF = 上游半路掐流（实测某些号只发
+/// 554B 的 ping 帧）。这类号 HTTP 状态是 200、额度也明明还有，走 blocked 会让绑定的对话
+/// 「原地等坏号」，所以并入 no_quota 的「掉出候选 → 推进换号」通道，90s 自动恢复。
+const FLAKY_TTL_MS: u64 = 90_000;
+
 pub const POLICY_EXPIRE: &str = "expire_first";
 pub const POLICY_MOST_LEFT: &str = "most_left";
 pub const POLICY_PINNED: &str = "pinned";
@@ -250,6 +255,9 @@ struct Inner {
 
     no_quota: HashMap<(String, String), u64>,
 
+    /// (号, 模型键) → 最近一次「截断流」时刻：短 TTL 内该号从候选里掉出（换号而非等待）。
+    flaky: HashMap<(String, String), u64>,
+
     blocked: HashMap<String, u64>,
 
     /// 每号在途请求数。并发调度用：新请求优先选在途少的号，
@@ -374,6 +382,11 @@ impl Gateway {
 
         let frozen: serde_json::Map<String, Value> = {
             let mut m = serde_json::Map::new();
+            for ((id, _), t) in g.flaky.iter() {
+                if now.saturating_sub(*t) < FLAKY_TTL_MS {
+                    m.insert(id.clone(), json!("截断"));
+                }
+            }
             for (id, t) in g.blocked.iter() {
                 if *t > now {
                     m.insert(id.clone(), json!("限流"));
@@ -1227,6 +1240,16 @@ impl Gateway {
                 }
             }
 
+            // 截断号：从候选里掉出（同 no_quota 的「换号而非等待」通道），FLAKY_TTL 后自愈。
+            {
+                let g = self.inner.lock().unwrap();
+                if let Some(t) = g.flaky.get(&(acc.id.clone(), model_k.clone())) {
+                    if now_ms().saturating_sub(*t) < FLAKY_TTL_MS {
+                        continue;
+                    }
+                }
+            }
+
             {
                 let g = self.inner.lock().unwrap();
                 if let Some(t) = g.blocked.get(&acc.id) {
@@ -1647,6 +1670,16 @@ struct Meter<R> {
 
     first_at: Option<u64>,
 
+    /// 截断检测：流式响应必须见到 message_stop 才算完整；EOF 前没有 = 上游半途掐流
+    /// （实测：某些号会只发 ~554B 的 message_start/ping 帧然后挂断，0 token）。截断按
+    /// 「该号对这个模型不可用」记账并复用 no_quota 换号机制 —— 下一次此对话自然推进到
+    /// 健康号，而不是钉死在坏号上反复吃空流。acct_id/model_resolved 供此用。
+    acct_id: String,
+    model_resolved: String,
+
+    /// 是否流式：只有流式才做「未见 message_stop 即截断」判定。
+    is_stream: bool,
+
     rec: Option<crate::usage::UsageRecord>,
     path: std::path::PathBuf,
 }
@@ -1671,6 +1704,35 @@ impl<R: Read> Read for Meter<R> {
             let mut code = peek_code(&self.head);
             if code.is_empty() {
                 code = peek_code(&self.tail);
+            }
+            // 截断流判定：Anthropic 正常收尾必有 message_stop（max_tokens 也有）；tail 存着
+            // 最后 8192 字节，收尾帧一定在其中。收到过字节却没见过它 = 上游半途掐流 ——
+            // 实测某些号只发 ~554B 的 message_start/ping 就挂断，过去被记成 200 成功：
+            // 对话绑定会把客户端钉死在这种号上反复吃空流（"跑几秒就截断"的真相）。
+            const STOP: &[u8] = b"message_stop";
+            let saw_stop = self.tail.windows(STOP.len()).any(|w| w == STOP);
+            if self.is_stream && self.bytes > 0 && !saw_stop {
+                // 只有「静默掐流」（流里没带任何错误码）才把号标截断 —— 有码的（如流内
+                // error/3012）原因已被识别，不该再额外惩罚账号换号。
+                let silent = code.is_empty();
+                if silent {
+                    code = "truncated".to_string();
+                    self.inner
+                        .lock()
+                        .unwrap()
+                        .flaky
+                        .insert((self.acct_id.clone(), model_key(&self.model_resolved)), now);
+                }
+                crate::flowlog::log(
+                    "relay",
+                    "truncated",
+                    &format!(
+                        "{} {ms}ms/{}B 未见 message_stop → {}",
+                        self.acct_id,
+                        self.bytes,
+                        if silent { "短冷却换号" } else { "仅记账（流内有错误码）" }
+                    ),
+                );
             }
             if let Some(mut rec) = self.rec.take() {
                 rec.tokens_in = self.tokens_in;
@@ -2561,6 +2623,9 @@ fn handle_external(
             bytes: 0,
             started: tried_at,
             first_at: None,
+            acct_id: c.id.clone(),
+            model_resolved: model.clone(),
+            is_stream: stream,
 
             rec: Some(crate::usage::UsageRecord {
                 t: tried_at,
@@ -3406,6 +3471,90 @@ mod tests {
         let t = gw.earliest_block().expect("有未来冷却");
         let now = now_ms();
         assert!(t - now <= 10_000 + 500, "应取最近的解冻点，实际剩 {}ms", t - now);
+    }
+
+    #[test]
+    fn truncated_stream_marks_flaky_complete_does_not() {
+        // 静默掐流（只有 message_start，无 message_stop）→ 标截断、进候选排除
+        let gw = Gateway::default();
+        let body: &[u8] = b"event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"glm-5.3\"}}
+
+";
+        let mut meter = Meter {
+            inner: gw.inner.clone(),
+            src: body,
+            tail: Vec::new(),
+            head: Vec::new(),
+            tokens: 0,
+            tokens_in: 0,
+            cache: 0,
+            bytes: 0,
+            started: now_ms(),
+            first_at: None,
+            acct_id: "a1".into(),
+            model_resolved: "GLM-5.3".into(),
+            is_stream: true,
+            rec: None,
+            path: std::path::PathBuf::new(),
+        };
+        let mut sink = Vec::new();
+        meter.read_to_end(&mut sink).unwrap();
+        assert!(
+            gw.inner.lock().unwrap().flaky.contains_key(&("a1".to_string(), model_key("GLM-5.3"))),
+            "截断流应把 (号,模型) 标进 flaky"
+        );
+
+        // 完整流（有 message_stop）→ 不标
+        let gw2 = Gateway::default();
+        let full: &[u8] = b"event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+        let mut m2 = Meter {
+            inner: gw2.inner.clone(),
+            src: full,
+            tail: Vec::new(),
+            head: Vec::new(),
+            tokens: 0,
+            tokens_in: 0,
+            cache: 0,
+            bytes: 0,
+            started: now_ms(),
+            first_at: None,
+            acct_id: "a2".into(),
+            model_resolved: "GLM-5.3".into(),
+            is_stream: true,
+            rec: None,
+            path: std::path::PathBuf::new(),
+        };
+        let mut s2 = Vec::new();
+        m2.read_to_end(&mut s2).unwrap();
+        assert!(gw2.inner.lock().unwrap().flaky.is_empty(), "完整流不该标 flaky");
+
+        // 非流式 JSON（usage 查询那类响应）→ 不做截断判定
+        let gw3 = Gateway::default();
+        let json_body: &[u8] = b"{\"model\":\"x\"}";
+        let mut m3 = Meter {
+            inner: gw3.inner.clone(),
+            src: json_body,
+            tail: Vec::new(),
+            head: Vec::new(),
+            tokens: 0,
+            tokens_in: 0,
+            cache: 0,
+            bytes: 0,
+            started: now_ms(),
+            first_at: None,
+            acct_id: "a3".into(),
+            model_resolved: "m".into(),
+            is_stream: false,
+            rec: None,
+            path: std::path::PathBuf::new(),
+        };
+        let mut s3 = Vec::new();
+        m3.read_to_end(&mut s3).unwrap();
+        assert!(gw3.inner.lock().unwrap().flaky.is_empty(), "非流式不跑截断判定");
     }
 
     #[test]
