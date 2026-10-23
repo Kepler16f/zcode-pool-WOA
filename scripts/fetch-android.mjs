@@ -6,13 +6,14 @@
 // ⚠ Windows 下 execSync 走 cmd.exe，命令行里的引号/管道会被它吃掉 —— 一切 gh 调用
 //   都走 execFileSync(数组参数)，过滤逻辑放在 JS 里做，jq 只用最简形式。
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const fail = (m) => { console.error(`[apk] ✗ ${m}`); process.exit(1); };
+const ver = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
 const gh = (...args) => execFileSync("gh", args, { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).trim();
 
 // 仓库坐标从 origin 推（不写死）：…:Kepler16f/zcode-pool-WOA.git → Kepler16f/zcode-pool-WOA
@@ -34,7 +35,7 @@ const downloads = join(homedir(), "Downloads");
 const cleanApks = (dir, label) => {
   if (!existsSync(dir)) return;
   for (const f of readdirSync(dir)) {
-    if (/^zcode-pool.*\.apk$/i.test(f)) {
+    if (/^(zcode-pool|Android|WOA).*\.apk$/i.test(f)) {
       rmSync(join(dir, f), { force: true });
       console.log(`[apk] ✓ 清旧 ${label}  ${f}`);
     }
@@ -66,12 +67,12 @@ const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
   e.isDirectory() ? walk(join(dir, e.name)) : [join(dir, e.name)]);
 const apk = walk(tmp).find((p) => p.toLowerCase().endsWith(".apk"));
 if (!apk) fail("artifact 里没找到 .apk");
-const dst = join(outDir, "zcode-pool-android-arm64.apk");
+const dst = join(outDir, `Android_${ver}.apk`);
 copyFileSync(apk, dst);
 console.log(`[apk] ✓ release/  ${basename(dst)}`);
 if (existsSync(downloads)) {
-  copyFileSync(apk, join(downloads, "zcode-pool-android-arm64.apk"));
-  console.log(`[apk] ✓ 已同步下载文件夹  zcode-pool-android-arm64.apk`);
+  copyFileSync(apk, join(downloads, `Android_${ver}.apk`));
+  console.log(`[apk] ✓ 已同步下载文件夹  Android_${ver}.apk`);
 }
 rmSync(tmp, { recursive: true, force: true });
 console.log(`[apk] 完成（源包 ${basename(apk)}，16-17MB 属正常：含 4 ABI 的 libzcode_pool_lib.so）`);

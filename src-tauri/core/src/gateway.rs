@@ -615,6 +615,11 @@ impl Gateway {
             "running": g.running,
             "port": g.port,
             "defaultPort": DEFAULT_PORT,
+            // 设置页直接管理局域网共享：bind / keys / 出站代理 一并带上
+            "bind": g.bind.clone(),
+            "lanHost": lan_host(),
+            "keys": g.keys.clone(),
+            "relayProxy": g.relay_proxy.clone(),
             "served": g.served,
             "switched": g.switched,
             "upstream": UPSTREAM,

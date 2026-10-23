@@ -69,7 +69,7 @@ mkdirSync(outDir, { recursive: true });
 // 每次构建先清掉【同类型】的上一次产物（exe 构建只清 exe，安卓 APK 由 fetch-android.mjs 管），
 // 保证 release/ 与下载文件夹里同一形态永远只有最新一版，不会新旧混着装错。
 for (const f of readdirSync(outDir)) {
-  if (/^zcode-pool.*\.exe$/i.test(f)) {
+  if (/^(zcode-pool|WOA).*\.exe$/i.test(f)) {
     rmSync(join(outDir, f), { force: true });
     console.log(`[dist] ✓ 清旧产物  ${f}`);
   }
@@ -80,7 +80,7 @@ const syncToDownloads = (path) => {
   if (!existsSync(downloads)) return;
   try {
     for (const f of readdirSync(downloads)) {
-      if (f !== basename(path) && /^zcode-pool.*setup.*\.exe$/i.test(f)) {
+      if (f !== basename(path) && /^(zcode-pool|WOA).*setup.*\.exe$/i.test(f)) {
         rmSync(join(downloads, f), { force: true });
         console.log(`[dist] ✓ 清下载文件夹旧包  ${f}`);
       }
@@ -94,7 +94,8 @@ const syncToDownloads = (path) => {
   }
 };
 const archSuffix = arch === "x64" ? "" : `_${arch}`;
-const portable = join(outDir, `zcode-pool_${ver}_portable${archSuffix}.exe`);
+// fork 版号命名：交付文件用 WOA_<ver>（与 App 内 app_version 前缀一致）
+const portable = join(outDir, `WOA_${ver}_portable${archSuffix}.exe`);
 copyFileSync(rawExe, portable);
 console.log(`[dist] ✓ 便携版  ${basename(portable)}  (${mb(portable)} MB)`); // 便携版只留 release/，下载文件夹只同步安装包
 
@@ -113,8 +114,10 @@ for (const dir of nsisDirs) {
   }
 }
 for (const [name, path] of [...setups].sort(([a], [b]) => a.localeCompare(b))) {
-  copyFileSync(path, join(outDir, name));
-  console.log(`[dist] ✓ 安装包  ${name}`);
-  syncToDownloads(join(outDir, name));
+  // 交付名换成 WOA_ 前缀（Tauri 生成的 zcode-pool_ 前缀仅作内部产物）
+  const out = name.startsWith("zcode-pool_") ? "WOA_" + name.slice("zcode-pool_".length) : name;
+  copyFileSync(path, join(outDir, out));
+  console.log(`[dist] ✓ 安装包  ${out}`);
+  syncToDownloads(join(outDir, out));
 }
 console.log(`[dist] 完成 → ${outDir}`);

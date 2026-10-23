@@ -530,6 +530,56 @@ const actions = {
       toast(t("s.proxySaved"), "ok", state.auth_proxy_on ? t("s.proxySavedOn") : t("s.proxySavedOff"));
     } catch (e) { toast(stripErr(e), "err"); }
   },
+  async toggleLan() {
+    // 后端 set_bind 强制「开局域网先要有 key」；这里没 key 就先建一个，省得用户
+    // 开了连不上还不知道原因。关 → bind 回 127.0.0.1。
+    await guard(async () => {
+      const r = relay || {};
+      const lanOn = !!(r.bind && r.bind !== "127.0.0.1" && r.bind !== "localhost" && r.bind !== "::1");
+      if (lanOn) {
+        relay = await invoke("console_bind", { bind: "127.0.0.1" });
+        toast(t("s.lanOff"), "ok");
+      } else {
+        if (!(r.keys && r.keys.length)) await invoke("console_key_add", { want: "" });
+        const host = r.lanHost && r.lanHost !== "127.0.0.1" ? r.lanHost : "0.0.0.0";
+        relay = await invoke("console_bind", { bind: host });
+        toast(t("s.lanOn"), "ok", host);
+      }
+      await refresh(); render();
+    });
+  },
+  async copyText(v) {
+    try {
+      await navigator.clipboard.writeText(String(v));
+      toast(t("s.copied"), "ok");
+    } catch {
+      // Android WebView / 非安全上下文 clipboard 可能被拒 —— 退回 execCommand
+      const ta = document.createElement("textarea");
+      ta.value = String(v); ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); toast(t("s.copied"), "ok"); }
+      catch (e) { toast(String(e), "err"); }
+      document.body.removeChild(ta);
+    }
+  },
+  async keyAdd() {
+    const input = document.getElementById("con-key-new-set");
+    await guard(async () => {
+      const res = await invoke("console_key_add", { want: (input && input.value.trim()) || "" });
+      toast(t("s.keyAdded"), "ok", res.key || "");
+      await refresh(); render();
+    });
+  },
+  async keyDel(k) {
+    await guard(async () => {
+      relay = await invoke("console_key_del", { key: k });
+      await refresh(); render();
+    });
+  },
+  async copyExample() {
+    const pre = document.getElementById("con-example-pre");
+    if (pre) await actions.copyText(pre.textContent);
+  },
   async saveClientVersion() {
     const input = document.querySelector("input.client-version");
     if (!input) return;
@@ -1321,6 +1371,7 @@ function settingsView(s) {
           </div>
         </div>
       </div>
+      ${lanShareGroup()}
       ${mob ? "" : `<div class="grp">
         <div class="gh">${t("s.pathLabel")}</div>
         <div class="gb">
@@ -1334,7 +1385,50 @@ function settingsView(s) {
         </div>
       </div>`}
       <div style="text-align:center;padding:12px 0">
-        <span style="font-size:12px;color:var(--label-3)">Z·POOL${appVer ? ` v${esc(appVer)}` : ""}</span>
+        <span style="font-size:12px;color:var(--label-3)">Z·POOL${appVer ? ` ${esc(appVer)}` : ""}</span>
+      </div>
+    </div>`;
+}
+
+
+function lanShareGroup() {
+  // 局域网可见 + API Key 管理（直接放设置页）。数据在 relay 全局（status() 已带
+  // bind/keys/lanHost/relayProxy）。开局域网前先要有 key —— 后端 set_bind 也强制，
+  // 这里只是把约束摆到明面上，避免用户开了却连不上还不知道为什么。
+  const r = relay || {};
+  const keys = r.keys || [];
+  const lanOn = !!(r.bind && r.bind !== "127.0.0.1" && r.bind !== "localhost" && r.bind !== "::1");
+  const host = r.lanHost && r.lanHost !== "127.0.0.1" ? r.lanHost : "<本机IP>";
+  const base = `http://${lanOn ? host : "127.0.0.1"}:${r.port || 8899}`;
+  const example = `# 任意 Anthropic/OpenAI 兼容客户端（填 Base URL + 一个 API Key）\nBase URL:    ${base}\n# Anthropic 协议端点：${base}/v1/messages\n# OpenAI  协议端点：${base}/v1/chat/completions\nAPI Key:     ${keys[0] || "(先在下方新建)"}`;
+  return `
+    <div class="grp">
+      <div class="gh">${t("s.lanTitle")}</div>
+      <div class="gb">
+        <div class="trow">
+          <div class="ti2"><div class="tl">${t("s.lanAllow")}</div>
+            <div class="td">${t("s.lanAllowDesc")}</div></div>
+          <button class="sw${lanOn ? " on" : ""}" role="switch" aria-checked="${lanOn}" click="actions.toggleLan()"></button>
+        </div>
+        <div class="line">
+          <div class="rstat"><span class="k">${t("s.lanBase")}</span><span class="v mono">${esc(base)}</span></div>
+          <button class="btn g sm" click="actions.copyText(${JSON.stringify(base)})">${t("s.copy")}</button>
+        </div>
+        <div class="gh" style="margin-top:6px">${t("s.keysTitle")}</div>
+        ${keys.length ? keys.map((k, i) => `
+          <div class="line">
+            <div class="rstat" style="flex:1;min-width:0"><span class="v mono" style="overflow:hidden;text-overflow:ellipsis">${esc(k)}</span></div>
+            <button class="btn g sm" click="actions.copyText(${JSON.stringify(k)})">${t("s.copy")}</button>
+            <button class="btn-ghost sm" click="actions.keyDel(${JSON.stringify(k)})">${t("s.keyDel")}</button>
+          </div>`).join("") : `<div class="hint">${t("s.keysEmpty")}</div>`}
+        <div class="line" style="margin-top:6px">
+          <input class="inp mono" id="con-key-new-set" placeholder="${t("s.keyPh")}" style="flex:1">
+          <button class="btn g sm" click="actions.keyAdd()">${t("s.keyAdd")}</button>
+        </div>
+        <div class="gh" style="margin-top:6px">${t("s.example")}</div>
+        <pre class="con-example" id="con-example-pre">${esc(example)}</pre>
+        <div class="line"><button class="btn g sm" click="actions.copyExample()">${t("s.copyExample")}</button></div>
+        <div class="hint">${t("s.lanNote")}</div>
       </div>
     </div>`;
 }
@@ -1420,7 +1514,7 @@ function render() {
   const stats = mboxStats();
   const sidebar = `
     <aside class="sidebar">
-      <div class="side-brand"><span class="mark">Z·POOL</span>${appVer ? `<span class="v">v${esc(appVer)}</span>` : ""}<span class="brand-caption">${t("m.workspace")}</span></div>
+      <div class="side-brand"><span class="mark">Z·POOL</span>${appVer ? `<span class="v">${esc(appVer)}</span>` : ""}<span class="brand-caption">${t("m.workspace")}</span></div>
       <nav class="nav">
         <button class="nav-item${tab === "mailbox" ? " on" : ""}" aria-current="${tab === "mailbox" ? "page" : "false"}" click="actions.setTab('mailbox')">
           ${ic("mail", 17)} ${t("m.tab.mailbox")}${stats.unverified ? `<span class="badge">${stats.unverified}</span>` : ""}

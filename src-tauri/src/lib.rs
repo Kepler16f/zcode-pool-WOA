@@ -163,7 +163,16 @@ async fn get_state() -> Result<AppState, String> {
 
 #[tauri::command]
 fn app_version(app: AppHandle) -> String {
-    app.package_info().version.to_string()
+    // fork 版号命名：WOA_<semver>（Windows ARM64）/ Android_<semver>（安卓）；
+    // 仅供应用内与安装包显示，semver 核心仍合法，构建链不感知前缀。
+    let ver = app.package_info().version.to_string();
+    let prefix = match std::env::consts::OS {
+        "android" => "Android_",
+        "ios" => "iOS_",
+        "windows" => "WOA_",
+        _ => "",
+    };
+    format!("{prefix}{ver}")
 }
 
 /// 前端据此分支导入/导出：桌面用原生文件对话框（tauri-plugin-dialog），

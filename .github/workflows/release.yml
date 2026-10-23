@@ -42,8 +42,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.2.3' }}
-          releaseName: 'Z·POOL v0.2.3 (Windows ARM64)'
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v1.0.0' }}
+          releaseName: 'Z·POOL ${{ github.ref_type == 'tag' && github.ref_name || 'v1.0.0' }} (Windows ARM64)'
           releaseBody: |
             ZCode 账号池 · Windows on ARM fork（zcode-pool-WOA）
 
@@ -65,3 +65,11 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: --target aarch64-pc-windows-msvc --bundles nsis
+
+      # 产物同时以 artifact 存一份（draft release 之外，方便脚本直接取回归档）
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-pool-windows-arm64
+          path: src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error

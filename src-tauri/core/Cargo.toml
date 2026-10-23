@@ -1,6 +1,6 @@
 [package]
 name = "zcode-pool-core"
-version = "0.2.3"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 description = "Z·POOL 业务核心：反代网关 / 号池存储 / OAuth / 额度查询（平台无关，无 GUI 依赖）"
