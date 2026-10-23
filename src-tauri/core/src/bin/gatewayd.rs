@@ -29,6 +29,8 @@ fn main() {
     relay.restore_persisted(&paths);
 
     let settings = store::load_settings(&paths);
+    // 模拟版本号覆盖同桌面壳：Web 控制台改了，重启守护进程后也要生效
+    zcode_pool_core::quota::set_client_version_override(settings.client_version());
     let port = port_arg
         .or(settings.relay_port)
         .unwrap_or(gateway::DEFAULT_PORT);

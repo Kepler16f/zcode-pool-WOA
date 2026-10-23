@@ -1355,6 +1355,24 @@ async fn set_behavior(
     r
 }
 
+/// 「模拟版本号」：上游按 app_version 过滤套餐展示，安卓/无 ZCode 环境可手动指定。
+/// 传空串 = 清除覆盖（恢复「探测安装 → 常量兜底」）。
+#[tauri::command]
+async fn set_client_version(app: AppHandle, version: String) -> Result<(), String> {
+    let v = version.trim().to_string();
+    if !v.is_empty() && !v.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return Err(i18n::tr("err.clientVersion.bad"));
+    }
+    {
+        let _guard = store_guard();
+        let paths = Paths::detect();
+        store::set_client_version(&paths, if v.is_empty() { None } else { Some(&v) })?;
+    }
+    quota::set_client_version_override(if v.is_empty() { None } else { Some(&v) });
+    let _ = app.emit("state-changed", ());
+    Ok(())
+}
+
 #[tauri::command]
 async fn set_language(app: AppHandle, lang: String) -> Result<(), String> {
     let l = i18n::Lang::parse(&lang)
@@ -1810,6 +1828,7 @@ pub fn run() {
             kill_zcode,
             set_behavior,
             set_language,
+            set_client_version,
             autostart_status,
             autostart_set,
             export_one,
@@ -1864,6 +1883,11 @@ pub fn run() {
             }
 
             i18n::init_from_settings(&store::load_settings(&Paths::detect()));
+            // 模拟版本号覆盖：让 quota::zcode_app_version() 从一开始就用用户设置值
+            // （安卓探测不到 ZCode 安装，靠这个覆盖才能看到活动套餐）。
+            quota::set_client_version_override(
+                store::load_settings(&Paths::detect()).client_version(),
+            );
             #[cfg(desktop)]
             if let Ok(data_dir) = app.path().app_local_data_dir() {
                 flowlog::init(&data_dir);

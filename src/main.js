@@ -530,6 +530,22 @@ const actions = {
       toast(t("s.proxySaved"), "ok", state.auth_proxy_on ? t("s.proxySavedOn") : t("s.proxySavedOff"));
     } catch (e) { toast(stripErr(e), "err"); }
   },
+  async saveClientVersion() {
+    const input = document.querySelector("input.client-version");
+    if (!input) return;
+    try {
+      await invoke("set_client_version", { version: input.value.trim() });
+      await refresh(); render();
+      toast(t("s.clientVersionSaved"), "ok");
+    } catch (e) { toast(stripErr(e), "err"); }
+  },
+  async clearClientVersion() {
+    try {
+      await invoke("set_client_version", { version: "" });
+      await refresh(); render();
+      toast(t("s.clientVersionCleared"), "ok");
+    } catch (e) { toast(stripErr(e), "err"); }
+  },
   acctQuota(id) {
     const dueAt = quotaDue[id];
     loadAcctQuota(id).then(() => {
@@ -1254,6 +1270,7 @@ function statsHtml(s) {
 }
 
 function settingsView(s) {
+  const mob = s.platform === "android" || s.platform === "ios";
   const row = (on, attr, label, desc) => `
     <div class="trow">
       <div class="ti2"><div class="tl">${label}</div>${desc ? `<div class="td">${desc}</div>` : ""}</div>
@@ -1274,9 +1291,23 @@ function settingsView(s) {
         <div class="gh">${t("s.behaviorLabel")}</div>
         <div class="gb">
           ${seg(s.language || "zh")}
-          ${row(autostart, "actions.toggleAutostart()", t("s.autostart"), t("s.autostartDesc"))}
-          ${row(s.launch_after_switch, "actions.toggleBehavior('launch')", t("s.launchAfter"), t("s.launchAfterDesc"))}
-          ${row(s.close_to_tray, "actions.toggleBehavior('tray')", t("s.closeTray"), t("s.closeTrayDesc"))}
+          ${mob ? "" : row(autostart, "actions.toggleAutostart()", t("s.autostart"), t("s.autostartDesc"))}
+          ${mob ? "" : row(s.launch_after_switch, "actions.toggleBehavior('launch')", t("s.launchAfter"), t("s.launchAfterDesc"))}
+          ${mob ? "" : row(s.close_to_tray, "actions.toggleBehavior('tray')", t("s.closeTray"), t("s.closeTrayDesc"))}
+        </div>
+      </div>
+      <div class="grp">
+        <div class="gh">${t("s.clientLabel")}</div>
+        <div class="gb">
+          <div class="line">
+            <input class="inp mono client-version" type="text" value="${esc(s.client_version || "")}"
+              placeholder="${t("s.clientVersionPh")}" keydown="onClientVersionKey(event)">
+            <button class="btn g" click="actions.saveClientVersion()">${t("common.save")}</button>
+          </div>
+          <div class="hint" style="margin-top:10px">${esc(t("s.clientVersionNow", { v: s.effective_client_version || "-" }))}
+            ${s.client_version ? `<button class="btn g sm" click="actions.clearClientVersion()">${t("s.clientVersionClear")}</button>` : ""}
+          </div>
+          <div class="hint" style="margin-top:6px">${t("s.clientVersionDesc")}</div>
         </div>
       </div>
       <div class="grp">
@@ -1290,7 +1321,7 @@ function settingsView(s) {
           </div>
         </div>
       </div>
-      <div class="grp">
+      ${mob ? "" : `<div class="grp">
         <div class="gh">${t("s.pathLabel")}</div>
         <div class="gb">
           <div class="line">
@@ -1301,7 +1332,7 @@ function settingsView(s) {
           </div>
           <div class="hint" style="margin-top:12px">${t("s.hint")}</div>
         </div>
-      </div>
+      </div>`}
       <div style="text-align:center;padding:12px 0">
         <span style="font-size:12px;color:var(--label-3)">Z·POOL${appVer ? ` v${esc(appVer)}` : ""}</span>
       </div>
@@ -1375,9 +1406,12 @@ function render() {
   const s = state;
   const active = s.accounts.find((a) => a.is_active) || null;
   const unsaved = s.live_logged_in && !active;
+  const mob = s.platform === "android" || s.platform === "ios";
 
-  const dotCls = s.zcode_running ? "run" : s.live_logged_in ? "" : "off";
-  const statusText = s.zcode_running
+  const dotCls = mob ? (s.live_logged_in ? "" : "off") : s.zcode_running ? "run" : s.live_logged_in ? "" : "off";
+  const statusText = mob
+    ? (s.live_logged_in ? (unsaved ? t("m.status.unsaved") : t("m.status.safe")) : t("m.status.loggedOut"))
+    : s.zcode_running
     ? t("m.status.running")
     : s.live_logged_in
       ? unsaved ? t("m.status.unsaved") : t("m.status.safe")
@@ -1406,7 +1440,7 @@ function render() {
         <div class="side-status${unsaved ? " unsaved" : ""}">
           <span class="status-dot ${dotCls}"></span>
           <span class="ss-text">${esc(statusText)}</span>
-          ${s.zcode_running
+          ${mob ? "" : s.zcode_running
             ? `<button class="zc-btn on" click="actions.askKill()" title="${t("btn.killZcode")}" aria-label="${t("btn.killZcode")}">${ic("power", 15)}</button>`
             : `<button class="zc-btn" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"} title="${t("btn.launchZcode")}" aria-label="${t("btn.launchZcode")}">${ic("play", 13)}</button>`}
         </div>
@@ -1451,7 +1485,7 @@ function render() {
         <button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${ic("userPlus", 16)} ${t("btn.addAccount")}</button>
         <button class="btn-ghost has-ic" click="actions.importFiles()" title="${t("s.importBtn")}">${ic("import", 16)} ${t("btn.import")}</button>
         <button class="btn-ghost has-ic" click="actions.exportAll()" ${s.accounts.length ? "" : "disabled"} title="${t("s.exportAllBtn")}">${ic("exportAll", 16)} ${t("btn.export")}</button>
-        ${s.zcode_running
+        ${mob ? "" : s.zcode_running
           ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${ic("power", 16)} ${t("btn.killZcode")}</button>`
           : s.zcode_path_ok
           ? `<button class="btn-ghost has-ic" click="actions.launch()">${ic("play", 14)} ${t("btn.launchZcode")}</button>`
@@ -1475,6 +1509,7 @@ window.actions = actions;
 setConsoleRerender(() => { if (!uiLocked() && !isEditing()) render(); });
 window.onPathKey = (e) => { if (e.key === "Enter") actions.savePath(); };
 window.onProxyKey = (e) => { if (e.key === "Enter") actions.saveProxy(); };
+window.onClientVersionKey = (e) => { if (e.key === "Enter") actions.saveClientVersion(); };
 window.onRenameKey = (e, id) => {
   if (e.key === "Enter") actions.doRename(id);
   if (e.key === "Escape") actions.cancelRename();

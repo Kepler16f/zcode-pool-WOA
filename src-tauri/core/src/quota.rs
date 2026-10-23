@@ -19,7 +19,27 @@ fn no_window(prog: &str) -> std::process::Command {
 pub const QUOTA_LIMIT_URL: &str = "https://open.bigmodel.cn/api/monitor/usage/quota/limit";
 pub const SUBSCRIPTION_URL: &str = "https://open.bigmodel.cn/api/biz/subscription/list";
 pub const BILLING_BALANCE_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance";
-pub const CLIENT_APP_VERSION: &str = "3.14.4";
+/// 探测不到 ZCode 安装时（安卓没有 ZCode，Linux/NAS 也没有）的**兜底模拟版本号**。
+/// ⚠ 上游按 app_version 过滤套餐：2026-10-23 实测 `billing/preview` 只有 ≥ 3.16.1 才
+/// 返回活动套餐（旧值 3.14.4 让安卓端「识别不出套餐/领不到」）。ZCode 客户端升级后
+/// 这里要跟着 bump，或让用户在「设置 → 模拟版本号」里覆盖（优先级高于本常量）。
+pub const CLIENT_APP_VERSION: &str = "3.16.2";
+
+/// 进程级「模拟版本号」覆盖（设置 → 模拟版本号；桌面/安卓/Web 控制台共用）。
+/// 上游会按 app_version 过滤套餐展示，版本号太旧 = 看不到可领套餐。
+static CLIENT_VERSION_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 设置模拟版本号。传空串/None = 清除覆盖，恢复「探测安装 → 常量兜底」。
+pub fn set_client_version_override(v: Option<&str>) {
+    let norm = v.map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string());
+    if let Ok(mut g) = CLIENT_VERSION_OVERRIDE.lock() {
+        *g = norm;
+    }
+}
+
+pub fn client_version_override() -> Option<String> {
+    CLIENT_VERSION_OVERRIDE.lock().ok().and_then(|g| g.clone())
+}
 
 pub(crate) fn client_platform() -> String {
     let os = crate::zcrypto::node_platform_for(std::env::consts::OS);
@@ -172,14 +192,19 @@ fn version_from_install() -> Option<String> {
 }
 
 pub fn zcode_app_version() -> String {
+    // ① 用户在「设置 → 模拟版本号」里的覆盖优先（每次都查，改了立刻生效）。
+    // 缓存只服务于②③：Windows 上探测要走 exe 版本资源 / reg.exe，开销不小。
+    if let Some(v) = client_version_override() {
+        return v;
+    }
     static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
-            // ① 最准的一手来源：ZCode 安装的 exe 版本资源
+            // ② 最准的一手来源：ZCode 安装的 exe 版本资源
             if let Some(v) = version_from_install() {
                 return v;
             }
-            // ② 退而求其次：注册表卸载项
+            // ③ 退而求其次：注册表卸载项
             let mut best: Option<String> = None;
             for hive in [
                 r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",

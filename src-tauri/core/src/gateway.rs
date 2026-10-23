@@ -13,16 +13,39 @@ const SWITCH_STATUS: [u16; 4] = [401, 402, 403, 429];
 const MAX_TRIES: usize = 4;
 
 /// 对话绑定历史里最多记多少个"用过的号"（纯内存裁剪，不是切换上限）。
-/// 绑定不硬顶号数：绑定号额度耗尽照常推进下一个（见 handle_external 选号循环）；
-/// 若推进到某号真触发上游 3012，则整条对话进冷却、不再吃任何号 —— 由上游判定保护池子。
+/// 绑定不硬顶号数：绑定号额度耗尽照常推进下一个（见 handle_external 选号循环）。
 const CONV_HISTORY_CAP: usize = 8;
-/// 对话绑定与 3012 黑名单的 TTL / 条数上限（LRU 淘汰，防长会话积累）。
+/// 对话绑定与 3012 熔断的 TTL / 条数上限（LRU 淘汰，防长会话积累）。
 const CONV_TTL_MS: u64 = 24 * 60 * 60 * 1000;
-/// 3012 对话的本地冷却。上游说「同对话 >2 号永久拉黑」，但实测新对话也会 3012
-/// （更像 IP/池级限流），所以本地**不永久封**：冷却一段时间后允许同一对话重试，
-/// 避免误杀一整天的正常会话。真正防串号靠绑定，这块只是止住对已死对话的反复空烧。
-const CONV_BLOCK_TTL_MS: u64 = 30 * 60 * 1000;
 const CONV_MAP_CAP: usize = 4000;
+
+/// ── 3012（上游风控）─────────────────────────────────────────────────────────
+/// 2026-10-19 实测把 3012 的归因钉死了：**按账号判**，与对话无关 ——
+/// 同一个 token 换任意新对话（连随机指纹）照样 3012；而没被判的号能正常出字。
+/// 同一时刻 billing/quota 端点是 200（所以 probe_one 探活"正常"≠ 模型端点能用）。
+/// 触发面像「突发流量」：连续扫 20 个号后整池一起进 3012，静置十几分钟仍未恢复。
+///
+/// 因此 3012 走三步处理（旧实现把它当「这条对话被拉黑」直接拒，且不换号 ——
+/// 池子一旦整体被判，客户端只会看到"一直 3012"）：
+///   ① 账号级冷却 ACCT_3012_TTL_MS：被判的号先别再发（探活看不到模型端点的 WAF，
+///      所以**不能**放进 blocked —— probe_one 成功会解冻 blocked，那样等于没冷却）；
+///   ② 同一发请求内换下一个号继续（最多 MAX_3012_TRIES 个），把"风控"降级成"换个号"；
+///   ③ 池里连续 MAX_3012_TRIES 个号都 3012 且近 POOL_OK_FRESH_MS 无任何模型请求成功
+///      → 判定为**池级**风控：暂停发放（POOL_3012_PAUSE_MS），回 429 + Retry-After，
+///      而不是继续一个个撞过去（撞得越多越像是在刷，还可能把好号也拖下水）。
+const ACCT_3012_TTL_MS: u64 = 10 * 60 * 1000;
+const MAX_3012_TRIES: usize = 2;
+const POOL_3012_PAUSE_MS: u64 = 45_000;
+/// 「池子最近是好的」判定窗口：窗口内有过任何到达模型层的应答（出字 / 1005 等），
+/// 就说明 3012 是个别号的问题，不该熔断整池（否则单用户空闲时会被误判成池级风控）。
+const POOL_OK_FRESH_MS: u64 = 120_000;
+/// 对话侧 3012 记账：同一条对话在 CONV_3012_TTL_MS 内撞到 ≥CONV_3012_STRIKES 个**不同**
+/// 账号，且此时池子是健康的（近 POOL_OK_FRESH_MS 有别的请求出字）→ 才熔断这条对话。
+/// 对齐上游「同对话被 >2 个号服务过即拉黑」的规则；池级风控在 ③ 已经拦下了，
+/// 这里只兜「账号没问题、偏偏这条对话过不去」的漏网情形。
+const CONV_3012_TTL_MS: u64 = 10 * 60 * 1000;
+const CONV_3012_STRIKES: usize = 3;
+const CONV_3012_FUSE_MS: u64 = 5 * 60 * 1000;
 const QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
 
 const NO_QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
@@ -265,15 +288,27 @@ struct Inner {
     /// 注意与上面取码池的 `inflight`（Vec）无关。
     busy: HashMap<String, u32>,
 
-    /// 对话 → 绑定账号（3012 风控对策）。上游实测：同一条对话被多个账号接力服务容易触发
-    /// 3012（此后该对话换任何号都过不去），而默认换号策略恰恰会在 429/额度尽时把一条对话
-    /// 接力给下一个号，等于主动踩雷。这里给每条对话钉一个号：只有当绑定号对该模型真的没
-    /// 额度了（不在 candidates 里）才解绑推进下一个号，其余错误（429/网络抖动）都等原号不换。
-    /// 不设推进硬顶 —— 两个号都耗尽照样换下一个；真撞到 3012 则由 conv_blocked 冷却兜底。
-    /// conv_bindings 会被 save_bindings 落盘（重启不丢绑定 → 不会因重启而“第二次换号”）。
+    /// 对话 → 绑定账号（稳定路由）。给每条对话钉一个号：只有当绑定号对该模型真的没
+    /// 额度了（不在 candidates 里）或它被 3012 冷却了，才推进下一个号；其余错误
+    /// （429/网络抖动）都等原号不换。conv_bindings 会被 save_bindings 落盘
+    /// （重启不丢绑定 → 不会因重启而"第二次换号"）。
     conv_bindings: HashMap<u64, ConvBinding>,
-    /// 被 3012 判过的对话指纹：命中直接拒，不再拿任何号去喂（保护整个池）。
+    /// 被熔断的对话指纹（3012 连撞 ≥CONV_3012_STRIKES 个号且池子健康）：命中直接拒。
     conv_blocked: HashMap<u64, u64>,
+
+    /// 账号级 3012 冷却（id → 解冻时刻）。**故意与 blocked 分开**：probe_one 探活成功会
+    /// 清 blocked（billing 端点是 200），但 3012 是模型端点的 WAF 判定，探活看不到 ——
+    /// 混在一起会被"探活成功"误解冻，下一个请求立刻又拿它去撞。
+    acct_3012: HashMap<String, u64>,
+    /// 池级 3012 暂停（解冻时刻，0 = 无）：连续多号被判 3012 且池子里近期没有任何请求
+    /// 成功出字 → 认定上游在打整池，暂停发放账号，直接回 429 让客户端按秒退避。
+    pool_3012_until: u64,
+    /// 最近一次"到达模型层"的应答时刻（成功出字 / 1005 额度尽等）。用来区分
+    /// 「个别号被风控」（池子健康，该换号）与「整池被风控」（该暂停）。
+    last_model_ok: u64,
+    /// 对话侧 3012 记账：对话 → (判过 3012 的不同账号 id, 最后命中时刻)。
+    /// 用于"账号没问题、偏偏这条对话过不去"时熔断该对话。
+    conv_3012: HashMap<u64, (Vec<String>, u64)>,
 }
 
 /// 一条对话用过的账号（按先后，最后一个是当前绑定号）。历史裁剪到 CONV_HISTORY_CAP。
@@ -327,6 +362,9 @@ struct Candidate {
     mid: String,
     expire: Option<String>,
     left: f64,
+    /// 该号对这个模型近期被标过「截断」（上游掐流）。**不剔除** —— 照常候选、照常显示、
+    /// 没得选时照样派活 —— 只在排序里垫底（不优先使用）。
+    flaky: bool,
 }
 
 impl Gateway {
@@ -460,6 +498,8 @@ impl Gateway {
             "lastRefresh": g.last_refresh.clone(),
             "convBindings": g.conv_bindings.len(),
             "convCooling": g.conv_blocked.values().filter(|t| **t > now).count(),
+            "acct3012": g.acct_3012.values().filter(|t| **t > now).count(),
+            "pool3012": g.pool_3012_until > now,
         })
     }
 
@@ -527,6 +567,19 @@ impl Gateway {
         Ok(self.console_status(paths))
     }
 
+    /// 设置「模拟版本号」：写入 settings 并同步进程级覆盖（quota::zcode_app_version 立即生效）。
+    /// 空串 = 清除覆盖，恢复「探测 ZCode 安装 → 常量兜底」。
+    pub fn set_client_version(&self, paths: &Paths, v: &str) -> Result<Value, String> {
+        let v = v.trim().to_string();
+        if !v.is_empty() && !v.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return Err("模拟版本号只能包含数字和点".into());
+        }
+        store::set_client_version(paths, if v.is_empty() { None } else { Some(&v) })?;
+        crate::quota::set_client_version_override(if v.is_empty() { None } else { Some(&v) });
+        crate::flowlog::log("relay", "client-version", if v.is_empty() { "清除覆盖（自动）" } else { &v });
+        Ok(self.console_status(paths))
+    }
+
     /// 删除 API Key；LAN 模式下最后一个 key 不许删（否则自己锁在门外）。
     pub fn remove_key(&self, paths: &Paths, key: &str) -> Result<Value, String> {
         let g = self.inner.lock().unwrap();
@@ -579,6 +632,8 @@ impl Gateway {
             "blocked": g.blocked.values().filter(|t| **t > now_ms()).count(),
             "convBindings": g.conv_bindings.len(),
             "convCooling": g.conv_blocked.values().filter(|t| **t > now_ms()).count(),
+            "acct3012": g.acct_3012.values().filter(|t| **t > now_ms()).count(),
+            "pool3012": g.pool_3012_until > now_ms(),
             "policy": g.policy,
             "pinned": g.pinned,
             "sticky": g.sticky,
@@ -676,6 +731,89 @@ impl Gateway {
         g.blocked.insert(id.to_string(), cur.max(now + ms));
     }
 
+    /// 账号被上游 3012 判了：冷却 ACCT_3012_TTL_MS（续期取 max，不缩短已有的冷却）。
+    fn mark_3012(&self, id: &str) {
+        mark_3012_locked(&mut self.inner.lock().unwrap(), id);
+    }
+
+    /// 池级 3012 暂停是否生效中（生效时不该再往下试号，直接回 429）。
+    fn pool_3012_till(&self) -> Option<u64> {
+        let t = self.inner.lock().unwrap().pool_3012_until;
+        (t > now_ms()).then_some(t)
+    }
+
+    /// 最早解冻的账号级 3012 冷却（用于"候选被风控清空"时给客户端一个 Retry-After）。
+    fn acct_3012_till(&self) -> Option<u64> {
+        let now = now_ms();
+        self.inner
+            .lock()
+            .unwrap()
+            .acct_3012
+            .values()
+            .filter(|t| **t > now)
+            .min()
+            .copied()
+    }
+
+    /// 池子最近是健康的吗（窗口内有过到达模型层的应答）。
+    fn model_ok_fresh(&self) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.last_model_ok > 0 && now_ms().saturating_sub(g.last_model_ok) <= POOL_OK_FRESH_MS
+    }
+
+    /// 有请求到达了模型层（成功出字 / 1005 等）：更新健康时刻，并解除池级暂停
+    /// —— 上游能正常处理就说明整池没被判死。
+    fn note_model_ok(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.last_model_ok = now_ms();
+        g.pool_3012_until = 0;
+    }
+
+    /// 连撞了 MAX_3012_TRIES 个号都 3012 时调用：池子近期没出过字 → 置池级暂停并返回 true。
+    /// 池子健康（别的对话正出字）→ 不暂停，返回 false，让调用方按"个别号被风控"回话。
+    fn arm_pool_3012(&self) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let now = now_ms();
+        if g.pool_3012_until > now {
+            return true;
+        }
+        let fresh = g.last_model_ok > 0 && now.saturating_sub(g.last_model_ok) <= POOL_OK_FRESH_MS;
+        if fresh {
+            return false;
+        }
+        g.pool_3012_until = now + POOL_3012_PAUSE_MS;
+        true
+    }
+
+    /// 对话侧 3012 记账。返回是否"熔断"了这条对话：窗口内撞过 >=CONV_3012_STRIKES 个
+    /// 不同账号，且此刻池子健康（说明不是整池被打，是这条对话自己过不去）。
+    fn note_conv_3012(&self, conv: Option<u64>, id: &str) -> bool {
+        let Some(cv) = conv else { return false };
+        let mut g = self.inner.lock().unwrap();
+        let now = now_ms();
+        g.conv_3012.retain(|_, (_, t)| t.saturating_add(CONV_3012_TTL_MS) > now);
+        if g.conv_3012.len() > CONV_MAP_CAP {
+            let mut order: Vec<(u64, u64)> = g.conv_3012.iter().map(|(k, (_, t))| (*k, *t)).collect();
+            order.sort_by_key(|(_, t)| *t);
+            for (k, _) in order.iter().take(g.conv_3012.len() - CONV_MAP_CAP) {
+                g.conv_3012.remove(k);
+            }
+        }
+        let e = g.conv_3012.entry(cv).or_insert((vec![], now));
+        if !e.0.iter().any(|x| x == id) {
+            e.0.push(id.to_string());
+        }
+        e.1 = now;
+        let strikes = e.0.len();
+        let fresh = g.last_model_ok > 0 && now.saturating_sub(g.last_model_ok) <= POOL_OK_FRESH_MS;
+        if strikes >= CONV_3012_STRIKES && fresh {
+            g.conv_blocked.insert(cv, now + CONV_3012_FUSE_MS);
+            true
+        } else {
+            false
+        }
+    }
+
     fn begin_busy(&self, id: &str) -> BusyGuard {
         if let Ok(mut g) = self.inner.lock() {
             *g.busy.entry(id.to_string()).or_default() += 1;
@@ -734,6 +872,8 @@ impl Gateway {
             }
             // 号已恢复（quota 端点探活成功）就别再被冷却表锁着：立即解冻。
             // 不这么做的话 429 要锁满整个 RATE_TTL，明明已健康，客户端却白白看 502 重连。
+            // 注意：3012 冷却（acct_3012）**故意不解冻** —— 探活打的是 billing 端点，
+            // 实测号被模型端点风控时 billing 照样 200，这里"探活成功"证明不了模型端能用。
             if out.is_ok() && g.blocked.remove(id).is_some() {
                 thawed = true;
             }
@@ -949,10 +1089,13 @@ impl Gateway {
 
     pub fn unfreeze(&self, id: &str) -> usize {
         let mut g = self.inner.lock().unwrap();
-        let before = g.no_quota.len() + g.blocked.len();
+        let before = g.no_quota.len() + g.blocked.len() + g.acct_3012.len();
         g.no_quota.retain(|(a, _), _| a != id);
         g.blocked.remove(id);
-        let n = before - (g.no_quota.len() + g.blocked.len());
+        // 3012 冷却也清：这是控制台里用户对单个号的明确指令（"我要立刻用它"）。
+        // 上游若仍判它会再次 3012、再次冷却 —— 代价有界，且用户的意图优先。
+        g.acct_3012.remove(id);
+        let n = before - (g.no_quota.len() + g.blocked.len() + g.acct_3012.len());
         if let Some(h) = g.health.get_mut(id) {
             h.streak = 0;
         }
@@ -1240,19 +1383,29 @@ impl Gateway {
                 }
             }
 
-            // 截断号：从候选里掉出（同 no_quota 的「换号而非等待」通道），FLAKY_TTL 后自愈。
+            // 截断号：不剔除（额度/显示/兜底都要它），只打降级标记，排序垫底。
+            let mut is_flaky = false;
             {
                 let g = self.inner.lock().unwrap();
                 if let Some(t) = g.flaky.get(&(acc.id.clone(), model_k.clone())) {
-                    if now_ms().saturating_sub(*t) < FLAKY_TTL_MS {
-                        continue;
-                    }
+                    is_flaky = now_ms().saturating_sub(*t) < FLAKY_TTL_MS;
                 }
             }
 
             {
                 let g = self.inner.lock().unwrap();
                 if let Some(t) = g.blocked.get(&acc.id) {
+                    if *t > now_ms() {
+                        continue;
+                    }
+                }
+            }
+
+            // 上游 3012 判过的号：冷却期内直接剔除（不是垫底）—— 再发只是白撞，
+            // 撞得越多越像在刷，还可能把别的号也带进风控。冷却结束自动回到候选。
+            {
+                let g = self.inner.lock().unwrap();
+                if let Some(t) = g.acct_3012.get(&acc.id) {
                     if *t > now_ms() {
                         continue;
                     }
@@ -1309,6 +1462,7 @@ impl Gateway {
                 mid: full.virtual_device_mid.unwrap_or_default(),
                 expire,
                 left,
+                flaky: is_flaky,
             });
         }
         match policy.as_str() {
@@ -1317,6 +1471,9 @@ impl Gateway {
             }),
             _ => list.sort_by(|a, b| a.expire.cmp(&b.expire).then(a.name.cmp(&b.name))),
         }
+        // 截断号垫底：稳定排序，只把 flaky 挪到队尾，健康号之间维持上面的策略顺序。
+        // 保留它们（额度/显示照旧、没得选时仍兜底），只是不优先派活 —— 与「剔除」的区别。
+        list.sort_by_key(|c| c.flaky);
         list
     }
 
@@ -1346,7 +1503,8 @@ impl Gateway {
         }
     }
 
-    /// 并发分流：同等条件下优先选**在途请求最少**的号（稳定排序，不破坏原排序语义）。
+    /// 并发分流 + 截断降级：先按「是否截断号」分组（健康号整体在前），组内再按在途数升序。
+    /// 稳定排序 → 空闲的截断号也不会插到繁忙的健康号前面（这才叫「不优先使用它」而非「剔除」）。
     /// 没有这一步时，两个并发任务会按同样的确定性顺序撞上同一个号 —— 上游对单号有并发
     /// 限制，挤兑就表现为 429 / 首包排队变慢，客户端「一直重新连接」。
     /// busy 由 BusyGuard 维护：进入上游 +1，响应流读完/断连/换号自动 -1，不会泄漏。
@@ -1355,7 +1513,7 @@ impl Gateway {
             return list;
         }
         let busy = self.inner.lock().unwrap().busy.clone();
-        list.sort_by_key(|c| busy.get(&c.id).copied().unwrap_or(0));
+        list.sort_by_key(|c| (c.flaky, busy.get(&c.id).copied().unwrap_or(0)));
         list
     }
 
@@ -1500,7 +1658,7 @@ fn block_ms(retry_after: Option<u64>) -> u64 {
 
 /// 对话指纹：Anthropic 格式里请求只带历史消息，`messages[0]`（开场轮）整段会话逐字不变
 /// （每轮 x-request-id 是新的，不能当锚点）。**只用开场轮**：多取几条会在第二轮"分裂"成
-/// 两个指纹 —— 同一条对话各自推进两个号，合计 4 个，正好踩「>2 号 = 3012」的雷。
+/// 两个指纹，同一条对话被算成两条 → 绑定/熔断都各算一份，白白多推进号。
 /// 反过来"误合并"（两条对话都以 hi 之类的开场撞指纹）只是共享同一个号，方向是安全的。
 /// 不含模型：同一条对话中途换模型还是同一条对话，按模型分叉绑定同样会推进超 2 个号。
 fn conversation_fingerprint(body: &[u8]) -> Option<u64> {
@@ -1559,29 +1717,26 @@ impl Gateway {
         g.blocked.get(id).map(|t| *t > now_ms()).unwrap_or(false)
     }
 
-    /// 清空全部对话绑定 + 3012 黑名单（Web 控制台「解除对话绑定」按钮）。
+    /// 清空全部对话绑定 + 3012 熔断/暂停（Web 控制台「解除对话绑定」按钮）。
     pub fn reset_conv_bindings(&self, paths: &Paths) -> usize {
         let mut g = self.inner.lock().unwrap();
-        let n = g.conv_bindings.len() + g.conv_blocked.len();
+        let n = g.conv_bindings.len() + g.conv_blocked.len() + g.conv_3012.len() + (g.pool_3012_until > now_ms()) as usize;
         g.conv_bindings.clear();
         g.conv_blocked.clear();
+        g.conv_3012.clear();
+        // 池级暂停是对上游状态的推断，用户手动重置就当"立刻再试一次"；账号级冷却不动
+        // （那是上游实打实判的，清了只会白撞）。
+        g.pool_3012_until = 0;
         drop(g);
         let _ = store::atomic_write(&paths.store_dir().join("conv-bindings.json"), "{}");
         n
     }
 
-    fn is_conv_blocked(&self, conv: u64) -> bool {
+    /// 熔断是否生效中 + 到点时刻（None = 没熔断）。
+    fn conv_block_till(&self, conv: u64) -> Option<u64> {
+        let now = now_ms();
         let g = self.inner.lock().unwrap();
-        g.conv_blocked.get(&conv).map(|t| *t > now_ms()).unwrap_or(false)
-    }
-
-    /// 上游 3012：这条对话大概率已被拉黑，短时间内别再拿任何号去撞（每次撞白烧额度，
-    /// 还可能把号拖下水）。本地记 CONV_BLOCK_TTL_MS 冷却而非永久 —— 实测新对话也会被
-    /// 3012（更像 IP/池级限流），永久封会误杀一整天的正常会话；到期后放行重试，
-    /// 若上游仍判死会再次进入冷却。
-    fn block_conv(&self, conv: u64) {
-        let mut g = self.inner.lock().unwrap();
-        g.conv_blocked.insert(conv, now_ms() + CONV_BLOCK_TTL_MS);
+        g.conv_blocked.get(&conv).copied().filter(|t| *t > now)
     }
 
     pub fn save_bindings(&self, paths: &Paths) {
@@ -1622,6 +1777,15 @@ fn prune_conv(binds: &mut HashMap<u64, ConvBinding>, blocked: &mut HashMap<u64, 
         }
     }
     blocked.retain(|_, t| *t > now);
+}
+
+/// 记账：该账号被上游 3012 判了（冷却 ACCT_3012_TTL_MS，续期取 max）。
+/// 独立于 blocked —— 探活（billing 端点）看不到模型端点的 WAF 判定，不能靠它解冻。
+fn mark_3012_locked(g: &mut Inner, id: &str) {
+    let now = now_ms();
+    g.acct_3012.retain(|_, t| *t > now);
+    let cur = g.acct_3012.get(id).copied().unwrap_or(0);
+    g.acct_3012.insert(id.to_string(), cur.max(now + ACCT_3012_TTL_MS));
 }
 
 fn account_session(id: &str, seed: &str) -> String {
@@ -1722,6 +1886,15 @@ impl<R: Read> Read for Meter<R> {
                         .unwrap()
                         .flaky
                         .insert((self.acct_id.clone(), model_key(&self.model_resolved)), now);
+                } else if code == "3012" {
+                    // 流到一半被上游 3012 打断：响应头早发出去了，客户端那份改不了，
+                    // 但这个号必须冷却 —— 否则别的对话马上又会被派到它头上，继续 3012。
+                    mark_3012_locked(&mut self.inner.lock().unwrap(), &self.acct_id);
+                    crate::flowlog::log(
+                        "relay",
+                        "acct-3012",
+                        &format!("{} 流内 3012 → 账号冷却 {}s", self.acct_id, ACCT_3012_TTL_MS / 1000),
+                    );
                 }
                 crate::flowlog::log(
                     "relay",
@@ -2235,9 +2408,10 @@ fn handle_external(
         model = to;
     }
 
-    // 对话指纹（3012 风控对策的锚点）：上游实测同一条对话被 ≥2 个账号服务过就永久拉黑。
-    // 后面据此做两件事：① 已判死的对话直接拒（不再浪费任何号）；② 对话钉死一个号，
-    // 只有这个号对所有模型真没额度了才推进下一个（其余错误等原号，不串号）。
+    // 对话指纹（3012 风控对策的锚点）：对话钉死一个号（除非绑定号额度真尽或被 3012 冷却），
+    // 以及"同一条对话连撞多个号"的对账（见 on_3012 / note_conv_3012）。
+    // 注：2026-10-19 实测 3012 是**按账号**判的（同 token 换新对话照样 3012），
+    // 所以这里的熔断不再是"被 3012 就封对话"，而是只在"池子健康、偏偏这条对话过不去"时触发。
     let conv = conversation_fingerprint(body);
 
     let usage_path = crate::usage::path_for(&paths.store_dir());
@@ -2280,17 +2454,37 @@ fn handle_external(
     }
     let agent = ab.build();
 
-    // 近期在这条对话上撞过 3012 的冷却窗口：暂停向它投放任何号（每撞一次白烧额度，
-    // 还可能把号拖下水）。到期后放它重试 —— 本地不永久封，判死与否交上游说了算。
+    // 池级 3012 暂停：整池刚被判风控，这一小段时间不再往下试号（试一个白烧一个），
+    // 直接 429 + Retry-After 让客户端按秒退避，暂停到点自动放行重试。
+    if let Some(till) = gw.pool_3012_till() {
+        let secs = (till.saturating_sub(now_ms()) / 1000).clamp(1, 120).to_string();
+        crate::usage::append(&usage_path, &mk("", 429, "3012", 0, false, now_ms()));
+        return reply_json_hdr(
+            slot.take().unwrap(),
+            429,
+            &[("Retry-After", &secs)],
+            &json!({ "type": "error",
+                     "error": { "type": "rate_limit_error",
+                                "message": format!("上游 3012 风控：池内账号被整体判定风险（不是这条对话的问题），已暂停投放约 {secs}s，到点自动重试。") } }),
+        );
+    }
+
+    // 这条对话被熔断（3012 连撞 ≥CONV_3012_STRIKES 个号且当时池子健康）：暂停向它投放账号，
+    // 到期自动放行。此时若池子正在风控/暂停，消息按池级来说 —— 别让用户误以为是自己这条对话被封。
     if let Some(c) = conv {
-        if gw.is_conv_blocked(c) {
-            crate::usage::append(&usage_path, &mk("", 405, "3012", 0, false, now_ms()));
-            return reply_json(
+        if let Some(till) = gw.conv_block_till(c) {
+            let secs = (till.saturating_sub(now_ms()) / 1000).clamp(1, 300).to_string();
+            let msg = if gw.pool_3012_till().is_some() || !gw.model_ok_fresh() {
+                format!("上游 3012 风控：池内账号正在冷却（不是这条对话的问题），约 {secs}s 后自动重试。")
+            } else {
+                format!("上游 3012 风控：这条对话疑似已被拉黑（连续在 {} 个账号上被判 3012），已熔断约 {secs}s，到期自动重试；若仍如此请开新对话。", CONV_3012_STRIKES)
+            };
+            crate::usage::append(&usage_path, &mk("", 429, "3012", 0, false, now_ms()));
+            return reply_json_hdr(
                 slot.take().unwrap(),
-                405,
-                &json!({ "type": "error",
-                         "error": { "type": "rate_limit_error",
-                                    "message": "这条对话刚触发过上游风控 3012，网关暂时不再向它投放账号（冷却中）。稍等自动恢复；若反复如此，请开一条新对话。" } }),
+                429,
+                &[("Retry-After", &secs)],
+                &json!({ "type": "error", "error": { "type": "rate_limit_error", "message": msg } }),
             );
         }
     }
@@ -2325,10 +2519,16 @@ fn handle_external(
         // 对话绑定（「除非额度用完不然不切换」）：
         // · 绑定号有额度（在本轮候选里）→ 只发它，别的号一个不碰
         // · 绑定号在 429/冷却 → 清空候选走下面的等待挂起，等它解冻（限流 ≠ 额度用完，不换号）
-        // · 绑定号掉出候选（额度真尽）→ 本轮照常推进下一个号（成功后绑定随之迁移）
+        // · 绑定号掉出候选（额度真尽，或被上游 3012 冷却）→ 本轮照常推进下一个号：
+        //   3012 是**账号**被风控，傻等它解冻只会让客户端一直卡着，换号才是对的
+        // · 例外：绑定号被标「截断降级」（flaky）且池里还有健康号 → 本轮不钉它，
+        //   直接用到队首的健康号（排序已把 flaky 垫底）——否则手机会每轮被钉回
+        //   掐流坏号，正是「跑几秒就截断」；全池都降级时仍用绑定号（不剔除的兜底意义）。
         if let Some(bid) = &bound {
-            if c.iter().any(|x| &x.id == bid) {
-                c.retain(|x| &x.id == bid);
+            if let Some(pos) = c.iter().position(|x| &x.id == bid) {
+                if !(c[pos].flaky && c.iter().any(|x| !x.flaky)) {
+                    c.retain(|x| &x.id == bid);
+                }
             } else if gw.is_blocked(bid) {
                 c.clear();
             }
@@ -2339,7 +2539,8 @@ fn handle_external(
             }
             break (m, c);
         }
-        // 只有「号池非空 + 全部在冷却」才值得等；额度用尽（no_quota）等不来结果，别吊着客户端。
+        // 候选空在「号被 3012 冷却」上：这不是挂起 45s 能等好的（冷却 10 分钟量级），
+        // 但它们要排在 429 冷却之后判断 —— 有 429 冷却可等时先把那点等完（那是秒级的）。
         let next = gw.earliest_block();
         match next {
             Some(t) if gw.has_any_account(paths) => {
@@ -2367,6 +2568,24 @@ fn handle_external(
                 let _ = gw.refresh_quota(paths, false);
             }
             _ => {
+                // 没有 429 冷却可等：先看是不是 3012 把号全判了。这种情况等不来（10 分钟量级），
+                // 直接回 429 + Retry-After（客户端按秒退避、别盲目重连）。
+                // 只在"池子近期没出过字"时这么说 —— 池子健康却候选为空，多半是额度/绑定问题，
+                // 按 3012 报会误导（也拦住下面那句 502）。
+                if let Some(till) = gw.acct_3012_till().filter(|_| !gw.model_ok_fresh()) {
+                    let at = now_ms();
+                    let secs = (till.saturating_sub(at) / 1000).clamp(1, 60).to_string();
+                    crate::usage::append(&usage_path, &mk("", 429, "3012", 0, false, at));
+                    crate::flowlog::log("relay", "acct-3012", &format!("候选被 3012 清空 → 429（等 {secs}s）"));
+                    return reply_json_hdr(
+                        slot.take().unwrap(),
+                        429,
+                        &[("Retry-After", &secs)],
+                        &json!({ "type": "error",
+                                 "error": { "type": "rate_limit_error",
+                                            "message": format!("上游 3012 风控：账号都被判定风险、冷却中（不是这条对话的问题），约 {secs}s 后自动恢复。") } }),
+                    );
+                }
                 let at = now_ms();
                 crate::usage::append(&usage_path, &mk("", 502, "no-account", 0, false, at));
                 return reply_json(
@@ -2381,6 +2600,50 @@ fn handle_external(
     };
 
     let mut tried = 0usize;
+    // 本发请求里被 3012 判掉的账号数（上限 MAX_3012_TRIES，见下面的 on_3012）。
+    let mut hits_3012 = 0usize;
+
+    // 3012 的统一处理（状态码 405 或 200 体里带 code 都会走到这里）：
+    //   ① 判它的号冷却 ACCT_3012_TTL_MS（与 blocked 分开，探活不解冻）；
+    //   ② 对话侧记账（同一条对话连撞多个号且池子健康 → 熔断该对话）；
+    //   ③ 还没到 MAX_3012_TRIES 且后面还有候选 → 换下一个号继续（把"风控"降级成"换个号"）；
+    //   ④ 到顶（或池子近期根本没出过字）→ 置池级暂停，回 429 + Retry-After。
+    //      Retry-After 之前，客户端每 6~7 秒重连一次，每个重连都换一个号去撞 3012 ——
+    //      "一直 3012"就是这么来的；现在改成快速失败 + 明确退避。
+    let mut on_3012 = |c: &Candidate, tried: usize, tried_at: u64| -> Option<(String, String)> {
+        hits_3012 += 1;
+        gw.mark_3012(&c.id);
+        let convicted = gw.note_conv_3012(conv, &c.id);
+        let pool_level = hits_3012 >= MAX_3012_TRIES && gw.arm_pool_3012();
+        crate::usage::append(&usage_path, &mk(&c.name, 429, "3012", tried, false, tried_at));
+        crate::flowlog::log(
+            "relay",
+            "acct-3012",
+            &format!(
+                "{} 3012 → 账号冷却 {}s{}{}",
+                c.name,
+                ACCT_3012_TTL_MS / 1000,
+                if convicted { "；该对话熔断（连撞多个号且池子健康）" } else { "" },
+                if pool_level { "；池级暂停" } else { "" }
+            ),
+        );
+        let more = tried < MAX_TRIES && tried < cands.len();
+        if !pool_level && hits_3012 < MAX_3012_TRIES && more {
+            return None; // 换下一个号继续
+        }
+        if pool_level {
+            let secs = (POOL_3012_PAUSE_MS / 1000).to_string();
+            return Some((
+                format!("上游 3012 风控：池内账号被整体判定风险（不是这条对话的问题），已暂停投放约 {secs}s，到点自动重试。"),
+                secs,
+            ));
+        }
+        let secs = (RATE_TTL_MS / 1000).to_string();
+        Some((
+            format!("上游 3012 风控：已连续 {hits_3012} 个账号被判风险并逐个冷却（账号级限流，不是这条对话被拉黑），约 {secs}s 后重试会自动换号。"),
+            secs,
+        ))
+    };
 
     let mut last_abnormal: Option<(u16, Option<String>, Vec<u8>, Box<dyn std::io::Read + Send>)> = None;
 
@@ -2456,9 +2719,10 @@ fn handle_external(
             }
         };
         if status == 429 {
-            // 限流不是「额度用完」，不换号（同对话 >2 号 = 3012 雷区）。标冷却后把 429 连同
-            // Retry-After 透传给客户端，让它退避重试；下一次该号已在冷却表里，candidates 会
-            // 自动避开 → 天然换到别的号或等待，绝不在这一发里接力第二个号。
+            // 限流（429）不是「额度用完」，也不像 3012 那样是账号被判风险：上游明确给了退避
+            // 时间，所以标冷却后把 429 连同 Retry-After 透传给客户端，让它自己退避重试；
+            // 下一次该号已在冷却表里，candidates 会自动避开 → 天然换到别的号或等待。
+            // （3012 不适用这条 —— 它是账号级风控，靠换号解决，见 on_3012。）
             let ttl = block_ms(ra);
             gw.mark_blocked(&c.id, ttl);
             crate::usage::append(&usage_path, &mk(&c.name, 429, "429", tried, false, tried_at));
@@ -2486,25 +2750,28 @@ fn handle_external(
         }
         // 非 200 / 非 SWITCH_STATUS 的错误（如上游 3012 走的 405）：以前会当"成功"
         // 原样透传给客户端 —— 客户端盲目重试就继续换号喂这条对话，把整个池一个接一个
-        // 拖进雷区。现在：非流式体里找 code；3012 → 拉黑该对话 + 明确报错；
+        // 拖进雷区。现在：非流式体里找 code；3012 → 账号冷却 + 换号（见 on_3012）；
         // 其余错误码 → 透传不重试（透传给客户端至少能看到真实原因）。
         if status >= 400 {
             let mut err_head = Vec::new();
             let _ = reader.take(8192).read_to_end(&mut err_head);
             let code = peek_code(&err_head);
             if code == "3012" {
-                if let Some(cv) = conv {
-                    gw.block_conv(cv);
-                    crate::flowlog::log("relay", "conv-blocked", &format!("{} 3012 → 该对话永久拒绝", c.name));
+                match on_3012(&c, tried, tried_at) {
+                    None => {
+                        crate::flowlog::log("relay", "switch", &format!("外部 {} 3012 → 换下一个号", c.name));
+                        continue;
+                    }
+                    Some((msg, secs)) => {
+                        return reply_json_hdr(
+                            slot.take().unwrap(),
+                            429,
+                            &[("Retry-After", &secs)],
+                            &json!({ "type": "error",
+                                     "error": { "type": "rate_limit_error", "message": msg } }),
+                        );
+                    }
                 }
-                crate::usage::append(&usage_path, &mk(&c.name, status, "3012", tried, false, tried_at));
-                return reply_json(
-                    slot.take().unwrap(),
-                    status,
-                    &json!({ "type": "error",
-                             "error": { "type": "rate_limit_error",
-                                        "message": "上游风控 3012：这条对话已被拉黑，换号也无法恢复。请开一条新对话。" } }),
-                );
             }
             let msg: String = String::from_utf8_lossy(&err_head).chars().take(300).collect();
             crate::usage::append(&usage_path, &mk(&c.name, status, &code, tried, false, tried_at));
@@ -2542,23 +2809,29 @@ fn handle_external(
             {
                 let ecode = peek_code(&head);
                 if ecode == "3012" {
-                    if let Some(cv) = conv {
-                        gw.block_conv(cv);
-                        crate::flowlog::log("relay", "conv-blocked", &format!("{} 200体3012 → 该对话永久拒绝", c.name));
+                    match on_3012(&c, tried, tried_at) {
+                        None => {
+                            crate::flowlog::log("relay", "switch", &format!("外部 {} 200体 3012 → 换下一个号", c.name));
+                            continue;
+                        }
+                        Some((msg, secs)) => {
+                            return reply_json_hdr(
+                                slot.take().unwrap(),
+                                429,
+                                &[("Retry-After", &secs)],
+                                &json!({ "type": "error",
+                                         "error": { "type": "rate_limit_error", "message": msg } }),
+                            );
+                        }
                     }
-                    crate::usage::append(&usage_path, &mk(&c.name, 405, "3012", tried, false, tried_at));
-                    return reply_json(
-                        slot.take().unwrap(),
-                        405,
-                        &json!({ "type": "error",
-                                 "error": { "type": "rate_limit_error",
-                                            "message": "上游风控 3012：这条对话已被拉黑，换号也无法恢复。请开一条新对话。" } }),
-                    );
                 }
                 if ecode == "1005" {
                     // 该号对这个模型额度耗尽：打标 → 下一次选号此对话才会正确地推进到第二个号。
                     gw.mark_no_quota(&c.id, &model);
                 }
+                // 能走到这里说明请求**过了风控**（上游答了 1005/别的业务码，只是不适合当流用）：
+                // 记一笔"池子还活着"，别让这类应答之后被误判成池级 3012 风控。
+                gw.note_model_ok();
                 let short: String = String::from_utf8_lossy(&head).chars().take(200).collect();
                 crate::flowlog::log("relay", "abnormal",
                     &format!("外部 {} ctype={ct_lower} 响应不像模型流，换下一个：{short}", c.name));
@@ -2568,6 +2841,8 @@ fn handle_external(
             reader = Box::new(std::io::Cursor::new(head).chain(reader));
         }
         gw.set_sticky(&c.id);
+        // 出字了 = 池子活着（也顺带解除池级 3012 暂停），3012 判定要靠它区分"个别号"与"整池"。
+        gw.note_model_ok();
         // 成功即绑定：对话钉在当前号上；新号绑定时落盘（重启不丢 → 不会产生"第二次换号"）。
         if let Some(cv) = conv {
             if gw.bind_account(cv, &c.id) {
@@ -2966,6 +3241,15 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("");
             return match gw.set_relay_proxy(&paths, url) {
+                Ok(st) => reply_json(req, 200, &st),
+                Err(e) => reply_json(req, 400, &json!({ "error": e })),
+            };
+        }
+        // 模拟版本号（空 = 清除覆盖，恢复自动）
+        "/proxy/client-version" => {
+            let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+            let ver = v.get("version").and_then(|x| x.as_str()).unwrap_or("");
+            return match gw.set_client_version(&paths, ver) {
                 Ok(st) => reply_json(req, 200, &st),
                 Err(e) => reply_json(req, 400, &json!({ "error": e })),
             };
@@ -3447,6 +3731,7 @@ mod tests {
             mid: String::new(),
             expire: None,
             left: 1.0,
+            flaky: false,
         };
         let gw = Gateway::default();
         // b 正在服务一个请求 → 新请求应优先排到空闲的 a/c
@@ -3460,6 +3745,28 @@ mod tests {
         let list2 = vec![mk_cand("x"), mk_cand("y"), mk_cand("z")];
         let out2 = gw2.idle_first(list2);
         assert_eq!(out2.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn idle_first_deprioritizes_flaky_even_when_idle() {
+        let cand = |id: &str, flaky: bool| Candidate {
+            id: id.to_string(),
+            name: id.to_string(),
+            token: String::new(),
+            mid: String::new(),
+            expire: None,
+            left: 1.0,
+            flaky,
+        };
+        let gw = Gateway::default();
+        // 健康号有 2 个在途、截断号空闲 —— 截断号仍不得插到健康号前（降级=垫底，非剔除，
+        // 但「不优先使用它」必须压过 busy 分流，否则空闲坏号会被优先选中，白降级）。
+        let _b1 = gw.begin_busy("healthy");
+        let _b2 = gw.begin_busy("healthy");
+        let list = vec![cand("flaky1", true), cand("healthy", false)];
+        let out = gw.idle_first(list);
+        let ids: Vec<&str> = out.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids[0], "healthy", "空闲截断号不能排到繁忙健康号前，实际={ids:?}");
     }
 
     #[test]
@@ -3599,6 +3906,97 @@ data: {\"type\":\"message_stop\"}
         assert!(gw.bind_account(cv, "c"));
         assert_eq!(gw.bound_account(cv).as_deref(), Some("c"), "绑定号是当前（最后）号");
         assert_eq!(gw.conv_history(cv), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn acct_3012_is_separate_from_blocked() {
+        // 3012 冷却必须与 blocked 分表：探活成功只清 blocked，不能把它误解冻。
+        let gw = Gateway::default();
+        gw.mark_3012("x");
+        assert!(gw.acct_3012_till().is_some(), "3012 应进入账号冷却");
+        assert_eq!(gw.earliest_block(), None, "3012 不该混进 429 冷却表");
+        // 模拟 probe_one 的解冻（只清 blocked）→ 3012 冷却仍在
+        gw.inner.lock().unwrap().blocked.remove("x");
+        assert!(gw.acct_3012_till().is_some(), "探活解冻不该清掉 3012 冷却");
+        // 续期取 max：再判一次不缩短已有冷却
+        let before = gw.acct_3012_till().unwrap();
+        gw.mark_3012("x");
+        assert!(gw.acct_3012_till().unwrap() >= before);
+    }
+
+    #[test]
+    fn pool_3012_arms_only_when_pool_is_stale() {
+        let gw = Gateway::default();
+        // 池子近期没出过字 → 连撞到顶 = 池级风控，置暂停
+        assert!(!gw.model_ok_fresh());
+        assert!(gw.arm_pool_3012());
+        assert!(gw.pool_3012_till().is_some());
+        // 有请求出字 → 解除池级暂停，且此后不再误判池级
+        gw.note_model_ok();
+        assert!(gw.pool_3012_till().is_none(), "出字即解除池级暂停");
+        assert!(gw.model_ok_fresh());
+        assert!(!gw.arm_pool_3012(), "池子健康时 3012 是个别号问题，不暂停整池");
+        assert!(gw.pool_3012_till().is_none());
+    }
+
+    #[test]
+    fn conv_3012_fuses_only_when_pool_is_healthy() {
+        // 池级风控期间：同一对话连撞多个号也不该熔断（问题不在对话）
+        let gw = Gateway::default();
+        assert!(!gw.note_conv_3012(Some(7), "a"));
+        assert!(!gw.note_conv_3012(Some(7), "b"));
+        assert!(!gw.note_conv_3012(Some(7), "c"), "池子没出过字 → 不熔断对话");
+        assert!(gw.conv_block_till(7).is_none());
+
+        // 池子健康：连撞 3 个不同号 → 熔断该对话
+        let gw2 = Gateway::default();
+        gw2.note_model_ok();
+        assert!(!gw2.note_conv_3012(Some(9), "a"));
+        assert!(!gw2.note_conv_3012(Some(9), "a"), "同一个号重复撞不算新的 strike");
+        assert!(!gw2.note_conv_3012(Some(9), "b"));
+        assert!(gw2.note_conv_3012(Some(9), "c"), "3 个不同号且池子健康 → 熔断");
+        assert!(gw2.conv_block_till(9).is_some());
+        // 别的对话不受牵连
+        assert!(gw2.conv_block_till(10).is_none());
+        // 无指纹 → 不熔断
+        assert!(!gw2.note_conv_3012(None, "d"));
+    }
+
+    #[test]
+    fn midstream_3012_cools_account_without_marking_flaky() {
+        // 流到一半出现 error/3012：给号打冷却，但不要误标成"截断号"。
+        let gw = Gateway::default();
+        let body: &[u8] = b"event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"glm-5.3\"}}
+
+event: error
+data: {\"type\":\"error\",\"error\":{\"code\":3012,\"msg\":\"blocked\"}}
+
+";
+        let mut meter = Meter {
+            inner: gw.inner.clone(),
+            src: body,
+            tail: Vec::new(),
+            head: Vec::new(),
+            tokens: 0,
+            tokens_in: 0,
+            cache: 0,
+            bytes: 0,
+            started: now_ms(),
+            first_at: None,
+            acct_id: "a1".into(),
+            model_resolved: "GLM-5.3".into(),
+            is_stream: true,
+            rec: None,
+            path: std::path::PathBuf::new(),
+        };
+        let mut sink = Vec::new();
+        meter.read_to_end(&mut sink).unwrap();
+        assert!(gw.acct_3012_till().is_some(), "流内 3012 应冷却该账号");
+        assert!(
+            gw.inner.lock().unwrap().flaky.is_empty(),
+            "带错误码的流不该再被标成截断号"
+        );
     }
 }
 

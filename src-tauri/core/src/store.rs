@@ -141,6 +141,17 @@ pub struct Settings {
     /// 有了这个设置，可以只让反代走代理，不用整天开着 TUN。
     #[serde(default)]
     pub relay_proxy: Option<String>,
+
+    /// 「模拟版本号」：发给上游的 app_version 覆盖（空/缺省 = 自动：探测安装 → 常量兜底）。
+    /// 上游按 app_version 过滤套餐；安卓探测不到 ZCode 安装，默认旧值会「识别不出套餐」。
+    #[serde(default)]
+    pub client_version: Option<String>,
+}
+
+pub fn set_client_version(paths: &Paths, v: Option<&str>) -> Result<(), String> {
+    let mut s = load_settings(paths);
+    s.client_version = v.map(str::trim).filter(|x| !x.is_empty()).map(|x| x.to_string());
+    save_settings(paths, &s)
 }
 
 pub fn set_relay_proxy(paths: &Paths, url: &str) -> Result<(), String> {
@@ -161,6 +172,9 @@ impl Settings {
     pub fn launch_after_switch(&self) -> bool { self.launch_after_switch.unwrap_or(true) }
     pub fn close_to_tray(&self) -> bool { self.close_to_tray.unwrap_or(true) }
     pub fn auto_claim(&self) -> bool { self.auto_claim.unwrap_or(false) }
+    pub fn client_version(&self) -> Option<&str> {
+        self.client_version.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
     pub fn auth_proxy(&self) -> Option<&str> {
         if self.auth_proxy_on.unwrap_or(false) {
             self.auth_proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -200,6 +214,12 @@ pub struct AppState {
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
     pub language: String,
+    /// "android" / "ios" / "windows" / ... —— 前端据此隐藏移动端不可用的功能
+    pub platform: &'static str,
+    /// 模拟版本号设置（空 = 自动）
+    pub client_version: Option<String>,
+    /// 当前实际发给上游的 app_version（含覆盖/探测/兜底后的结果）
+    pub effective_client_version: String,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -1528,6 +1548,9 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),
+        platform: std::env::consts::OS,
+        client_version: settings.client_version.clone(),
+        effective_client_version: crate::quota::zcode_app_version(),
     })
 }
 

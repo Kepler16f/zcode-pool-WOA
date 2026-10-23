@@ -14,6 +14,12 @@ resolver = "2"
 name = "zcode_pool_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# 生产构建必须开它：tauri 的 build.rs 用 dev = !custom-protocol 决定 WebView 加载
+# 内嵌 dist 资源还是去连 devUrl(127.0.0.1:5173)。裸 cargo build --release 会静默
+# 打出开发壳 —— 面板显示"127.0.0.1 拒绝连接"。
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
