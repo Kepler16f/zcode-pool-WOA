@@ -11,6 +11,7 @@
     "icons": "tauri icon assets/app-icon.svg",
     "dist": "node scripts/dist.mjs",
     "apk": "node scripts/fetch-android.mjs",
+    "exe": "node scripts/fetch-desktop.mjs",
     "check:i18n": "node scripts/check-i18n-keys.mjs"
   },
   "dependencies": {
