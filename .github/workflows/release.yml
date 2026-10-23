@@ -43,7 +43,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v1.0.0' }}
-          releaseName: 'Z·POOL ${{ github.ref_type == 'tag' && github.ref_name || 'v1.0.0' }} (Windows ARM64)'
+          releaseName: "Z·POOL ${{ github.ref_type == 'tag' && github.ref_name || 'v1.0.0' }} (Windows ARM64)"
           releaseBody: |
             ZCode 账号池 · Windows on ARM fork（zcode-pool-WOA）
 
