@@ -1744,6 +1744,11 @@ async fn console_proxy_url(url: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn console_client_version(version: String) -> Result<Value, String> {
+    relay().set_client_version(&Paths::detect(), &version)
+}
+
+#[tauri::command]
 async fn console_model_map(from: String, to: String) -> Result<Value, String> {
     relay().set_model_map(&Paths::detect(), &from, &to)
 }
@@ -1854,6 +1859,7 @@ pub fn run() {
             console_key_add,
             console_key_del,
             console_proxy_url,
+            console_client_version,
             console_model_map,
             console_unfreeze,
             console_reset_conv,

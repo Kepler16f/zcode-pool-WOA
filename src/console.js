@@ -76,6 +76,8 @@ window.cact = {
   keyDel: (i) => act(async () => { await invoke("console_key_del", { key: data.keys[i] }); }),
   proxySave: () => act(async () => { await invoke("console_proxy_url", { url: gid("con-proxy").value }); }),
   proxyClear: () => act(async () => { await invoke("console_proxy_url", { url: "" }); }),
+  verSave: () => act(async () => { await invoke("console_client_version", { version: gid("con-ver").value.trim() }); }),
+  verClear: () => act(async () => { await invoke("console_client_version", { version: "" }); }),
   policy: (v) => act(async () => { await invoke("relay_policy", { policy: v, pinned: null }); }),
   modelMode: () => act(async () => {
     const mode = gid("con-mmode").value;
@@ -245,6 +247,12 @@ function gwPanel() {
           <button class="btn g sm" click="cact.proxySave()">${t("con.apply")}</button>
           ${data.relayProxy ? `<button class="btn g sm" click="cact.proxyClear()">${t("con.clear")}</button>` : ""}</div>
         <div class="hint">${t("con.proxyDesc")}</div>
+      </div></div>
+      <div class="grp"><div class="gh">${t("con.clientVersion")}</div><div class="gb">
+        <div class="trow"><input id="con-ver" class="con-in" placeholder="${t("con.clientVersionPh")}" value="${esc(data.clientVersion || "")}" style="flex:1">
+          <button class="btn g sm" click="cact.verSave()">${t("con.apply")}</button>
+          ${data.clientVersion ? `<button class="btn g sm" click="cact.verClear()">${t("con.clear")}</button>` : ""}</div>
+        <div class="hint">${t("con.clientVersionNow", { v: esc(data.zcodeVersion || "-") })} · ${t("con.clientVersionDesc")}</div>
       </div></div>
       <div class="grp"><div class="gh">${t("con.strategy")}</div><div class="gb">
         <div class="trow"><div class="ti2"><div class="tl">${t("con.policy")}</div></div>

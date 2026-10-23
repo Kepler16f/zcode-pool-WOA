@@ -480,6 +480,7 @@ impl Gateway {
             "totalMs": g.last_total_ms,
             // 反代对外冒充的 ZCode 客户端版本（从安装的 exe 里读，读不到才用兜底常量）
             "zcodeVersion": crate::quota::zcode_app_version(),
+            "clientVersion": store::load_settings(paths).client_version,
             "relayProxy": g.relay_proxy,
             "bind": g.bind,
             "keys": g.keys,
