@@ -1386,18 +1386,25 @@ fn export_config(config: Option<&Value>) -> Value {
     json!({ "provider": Value::Object(kept) })
 }
 
-pub fn export_bundle_value(accounts: &[Account]) -> Value {
+/// `decrypt_to = Some(home)`：把机器绑定密文解平成明文，账号包跨设备（PC→手机）可移植；
+/// `None`：原样带出密文（局域网非回环导出用它，避免把解开的 token 摊给扫描者，交给 mask_json）。
+pub fn export_bundle_value(accounts: &[Account], decrypt_to: Option<&Path>) -> Value {
+    let secret = decrypt_to.map(zcrypto::default_secret);
+    let flat = |v: Value| match &secret {
+        Some(s) => zcrypto::decrypt_value_deep(&v, s),
+        None => v,
+    };
     json!({
         "format": "zcode-accounts-bundle",
-        "version": 2,
+        "version": 3,
         "exportedAt": now_ts(),
         "accounts": accounts.iter().map(|a| json!({
             "name": a.name,
             "createdAt": a.created_at,
-            "credentials": export_credentials(&a.credentials),
+            "credentials": flat(export_credentials(&a.credentials)),
             "virtualDeviceMid": a.virtual_device_mid,
             "virtualArmsUid": a.virtual_arms_uid,
-            "config": export_config(a.config.as_ref()),
+            "config": flat(export_config(a.config.as_ref())),
         })).collect::<Vec<_>>(),
     })
 }

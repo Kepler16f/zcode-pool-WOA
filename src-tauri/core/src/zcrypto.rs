@@ -69,6 +69,28 @@ pub fn is_encrypted(v: &str) -> bool {
     v.starts_with(PREFIX)
 }
 
+/// 递归解密一份 JSON 里所有 `enc:v1:` 字符串为明文（解不开的原样保留，绝不丢数据）。
+/// 导出前用它，把机器绑定的密文（ZCode 用 `platform:home:username` 派生密钥加密）摊平，
+/// 这样账号包跨设备（PC→手机）导入后一定能读到 token —— 否则换机密钥不同 → 解不开 →
+/// candidate_tokens 为空 → 号被当成"没登录"跳过 → 池看似空 → 502 no-account / 一说话就断。
+pub fn decrypt_value_deep(v: &Value, secret: &str) -> Value {
+    match v {
+        Value::String(s) if is_encrypted(s) => match decrypt_with_secret(s, secret) {
+            Ok(p) => Value::String(p),
+            Err(_) => v.clone(), // 解不开（本就是别处明文/损坏）→ 原样
+        },
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, val) in map {
+                out.insert(k.clone(), decrypt_value_deep(val, secret));
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => arr.iter().map(|x| decrypt_value_deep(x, secret)).collect(),
+        other => other.clone(),
+    }
+}
+
 pub fn decrypt_with_secret(value: &str, secret: &str) -> Result<String, String> {
     let body = value.strip_prefix(PREFIX).ok_or("不是 enc:v1 格式")?;
     let parts: Vec<&str> = body.split('.').collect();

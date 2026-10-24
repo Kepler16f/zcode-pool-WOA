@@ -1468,7 +1468,7 @@ async fn export_one(app: AppHandle, id: String) -> Result<serde_json::Value, Str
         return Ok(json!({ "picked": false }));
     };
     let path = fp.into_path().map_err(|e| i18n::trf("err.path.invalid", &[("e", &e.to_string())]))?;
-    let payload = store::export_bundle_value(std::slice::from_ref(&acc));
+    let payload = store::export_bundle_value(std::slice::from_ref(&acc), Some(&Paths::detect().home));
     let body = serde_json::to_string_pretty(&payload).unwrap() + "\n";
     store::atomic_write(&path, &body).map_err(|e| i18n::trf("err.write", &[("e", &e.to_string())]))?;
     Ok(json!({ "picked": true, "path": path.to_string_lossy(), "name": acc.name }))
@@ -1490,7 +1490,7 @@ async fn export_all(app: AppHandle) -> Result<serde_json::Value, String> {
         return Ok(json!({ "picked": false }));
     };
     let path = fp.into_path().map_err(|e| i18n::trf("err.path.invalid", &[("e", &e.to_string())]))?;
-    let payload = store::export_bundle_value(&accounts);
+    let payload = store::export_bundle_value(&accounts, Some(&Paths::detect().home));
     let body = serde_json::to_string_pretty(&payload).unwrap() + "\n";
     store::atomic_write(&path, &body).map_err(|e| i18n::trf("err.write", &[("e", &e.to_string())]))?;
     Ok(json!({ "picked": true, "path": path.to_string_lossy(), "count": accounts.len() }))

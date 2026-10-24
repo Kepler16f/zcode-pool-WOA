@@ -1483,6 +1483,101 @@ impl Gateway {
         list
     }
 
+    /// 号池选不出人时的真实原因归因（镜像 candidates 的每条剔除路径）。返回给 502 与
+    /// 控制台，专门用来回答手机端那句「一说话就 502 no-account 到底是没额度还是号坏了」——
+    /// 最常见就是**从别的机器导过来的号凭据解不开**（ZCode 密文绑 platform:home:username），
+    /// 这类号在 candidates 里被静默跳过，看起来就像“池是空的”。
+    pub fn pool_diagnosis(&self, paths: &Paths, model: &str) -> String {
+        let accounts = match store::list_accounts(paths) {
+            Ok(a) => a,
+            Err(e) => return format!("读号池失败：{e}"),
+        };
+        if accounts.is_empty() {
+            return "池里一个号都没有（先把账号导入进来）".to_string();
+        }
+        let model_k = model_key(model);
+        let secret = crate::zcrypto::default_secret(&paths.home);
+        let now = now_ms();
+        let (mut bad_creds, mut noquota, mut cooling, mut flaky_only, mut ready) = (0, 0, 0, 0, 0);
+        for acc in &accounts {
+            // 凭据解不出 token = 号“没登录”，跨设备导入的密文号正落在这
+            let jwt_ok = store::load_account(paths, &acc.id)
+                .ok()
+                .and_then(|full| {
+                    crate::quota::candidate_tokens(&full.credentials, full.config.as_ref(), &secret)
+                        .into_iter()
+                        .next()
+                })
+                .is_some();
+            if !jwt_ok {
+                bad_creds += 1;
+                continue;
+            }
+            let g = self.inner.lock().unwrap();
+            let cooling_now = g
+                .blocked
+                .get(&acc.id)
+                .map(|t| *t > now)
+                .unwrap_or(false)
+                || g.acct_3012.get(&acc.id).map(|t| *t > now).unwrap_or(false);
+            let quota_for_model = g
+                .quota
+                .get(&acc.id)
+                .map(|(_, ov)| {
+                    ov.plans.iter().any(|p| {
+                        p.items
+                            .iter()
+                            .any(|it| model_same(&it.name, model) && it.remaining.unwrap_or(0.0) > 0.0)
+                    })
+                })
+                .unwrap_or(false);
+            let flaky = g
+                .flaky
+                .get(&(acc.id.clone(), model_k.clone()))
+                .map(|t| now.saturating_sub(*t) < FLAKY_TTL_MS)
+                .unwrap_or(false);
+            let exhausted = g
+                .no_quota
+                .get(&(acc.id.clone(), model_k.clone()))
+                .map(|t| now.saturating_sub(*t) < NO_QUOTA_TTL_MS)
+                .unwrap_or(false);
+            drop(g);
+            if cooling_now {
+                cooling += 1;
+            } else if !quota_for_model || exhausted {
+                noquota += 1;
+            } else if flaky {
+                flaky_only += 1;
+            } else {
+                ready += 1;
+            }
+        }
+        let total = accounts.len();
+        let mut parts = vec![];
+        if bad_creds > 0 {
+            parts.push(format!("{bad_creds} 个号凭据解不开（多半是从别的设备导来的密文号，需重新导出可移植包再导入）"));
+        }
+        if noquota > 0 {
+            parts.push(format!("{noquota} 个号该模型无额度"));
+        }
+        if cooling > 0 {
+            parts.push(format!("{cooling} 个号限流/3012 冷却中"));
+        }
+        if flaky_only > 0 {
+            parts.push(format!("{flaky_only} 个号刚被截断降级"));
+        }
+        // ready>0 却选不出，通常是 sticky/并发临时占满；一并报出来免得误判
+        if ready > 0 {
+            parts.push(format!("{ready} 个号健康（可能被并发/固定策略临时占用）"));
+        }
+        let _ = total;
+        if parts.is_empty() {
+            "未知".to_string()
+        } else {
+            parts.join("；")
+        }
+    }
+
     fn sticky_order(&self, mut list: Vec<Candidate>) -> Vec<Candidate> {
         if list.is_empty() {
             return list;
@@ -2594,12 +2689,13 @@ fn handle_external(
                 }
                 let at = now_ms();
                 crate::usage::append(&usage_path, &mk("", 502, "no-account", 0, false, at));
+                let reason = gw.pool_diagnosis(paths, &model);
                 return reply_json(
                     slot.take().unwrap(),
                     502,
                     &json!({ "type": "error",
                              "error": { "type": "overloaded_error",
-                                        "message": format!("号池里没有可用于 {model} 的号") } }),
+                                        "message": format!("号池里没有可用于 {model} 的号 —— {reason}") } }),
                 );
             }
         }
@@ -3484,7 +3580,8 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             if accounts.is_empty() {
                 return reply_json(req, 400, &json!({ "error": "账号库是空的" }));
             }
-            let mut payload = store::export_bundle_value(&accounts);
+            // 回环=机主自用：解平成明文包，导给手机可直接用；非回环不解平（mask_json 兜底）。
+            let mut payload = store::export_bundle_value(&accounts, if from_loopback { Some(&paths.home) } else { None });
             if !from_loopback { mask_json(&mut payload); }
             let body = serde_json::to_string_pretty(&payload).unwrap_or_default() + "\n";
             return reply_text(req, body, "zcode-accounts.json");

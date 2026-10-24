@@ -199,7 +199,7 @@ pub fn run(args: &[String]) -> (String, i32) {
             };
             match load_account(&paths, &id) {
                 Ok(a) => {
-                    let payload = export_bundle_value(std::slice::from_ref(&a));
+                    let payload = export_bundle_value(std::slice::from_ref(&a), Some(&paths.home));
                     match serde_json::to_string_pretty(&payload) {
                         Ok(body) => match atomic_write(std::path::Path::new(&out_path), &(body + "\n")) {
                             Ok(()) => ok(json!({ "out": out_path })),
@@ -215,7 +215,7 @@ pub fn run(args: &[String]) -> (String, i32) {
             let Some(out_path) = flag(rest, "--out") else {
                 return (err(&zcode_pool_core::i18n::tr("cli.usage.export_all")), 2);
             };
-            match list_accounts(&paths).map(|a| export_bundle_value(&a)) {
+            match list_accounts(&paths).map(|a| export_bundle_value(&a, Some(&paths.home))) {
                 Ok(payload) => match atomic_write(
                     std::path::Path::new(&out_path),
                     &(serde_json::to_string_pretty(&payload).unwrap() + "\n"),
