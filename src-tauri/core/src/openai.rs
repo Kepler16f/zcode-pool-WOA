@@ -157,6 +157,47 @@ pub fn body_to_anthropic(raw: &[u8]) -> Result<Value, String> {
             map.insert(k.into(), x.clone());
         }
     }
+    // 工具定义转发（2026-10-24 装机症状"思考完说要开始工作，然后断掉"的根因）：白名单当年没拷
+    // tools——上游看不到任何工具，模型想调也无从调起，只能 end_turn 收口，端侧看起来就像"正好
+    // 卡在工具调用前被截断"。OpenAI 形 {type:function,function:{name,description,parameters}}
+    // → Anthropic 形 {name,description,input_schema}；tool_choice 同步映射。
+    if let Some(arr) = obj.get("tools").and_then(Value::as_array) {
+        let mut converted: Vec<Value> = Vec::new();
+        for it in arr {
+            let f = it.get("function").unwrap_or(it);
+            let Some(name) = f.get("name").and_then(Value::as_str) else { continue };
+            let mut entry = json!({ "name": name });
+            if let Some(d) = f.get("description").and_then(Value::as_str) {
+                entry["description"] = json!(d);
+            }
+            entry["input_schema"] = f
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            converted.push(entry);
+        }
+        if !converted.is_empty() {
+            map.insert("tools".into(), json!(converted));
+            match obj.get("tool_choice") {
+                Some(Value::String(s)) => {
+                    map.insert(
+                        "tool_choice".into(),
+                        match s.as_str() {
+                            "none" => json!({"type": "none"}),
+                            "required" => json!({"type": "any"}),
+                            _ => json!({"type": "auto"}),
+                        },
+                    );
+                }
+                Some(tc) => {
+                    if let Some(n) = tc.pointer("/function/name").and_then(Value::as_str) {
+                        map.insert("tool_choice".into(), json!({"type": "tool", "name": n}));
+                    }
+                }
+                None => {}
+            }
+        }
+    }
     // 思维链开关：优先级为 原生 thinking 对象 > reasoning_effort 档位映射 > 不开思考。
     // 1) 客户端若已带 Anthropic 形 `thinking`（{"type":"enabled","budget_tokens":N}）则原样转发，
     //    上游据此返回 thinking 块，再由 resp_to_openai / StreamTee 翻成 reasoning_content。
@@ -605,6 +646,35 @@ mod tests {
         let a = body_to_anthropic(raw.as_bytes()).unwrap();
         assert_eq!(a["thinking"], json!({"type":"enabled","budget_tokens":1234}));
         assert_eq!(a["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn openai_tools_are_forwarded_as_anthropic_tools() {
+        // 装机回归钉：请求侧丢 tools＝上游没工具可调，"说要开始工作然后断掉"。
+        let raw = r#"{"model":"m","tools":[{"type":"function","function":{"name":"bash","description":"跑命令","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}}],"messages":[{"role":"user","content":"x"}]}"#;
+        let a = body_to_anthropic(raw.as_bytes()).unwrap();
+        assert_eq!(a["tools"][0]["name"], "bash");
+        assert_eq!(a["tools"][0]["description"], "跑命令");
+        assert_eq!(a["tools"][0]["input_schema"]["properties"]["cmd"]["type"], "string");
+        // 无 tools 的请求不注入空键（行为与旧版逐字节一致的路径不扩面）。
+        let raw2 = r#"{"model":"m","messages":[{"role":"user","content":"x"}]}"#;
+        let b = body_to_anthropic(raw2.as_bytes()).unwrap();
+        assert!(b.get("tools").is_none());
+    }
+
+    #[test]
+    fn tool_choice_is_mapped_to_anthropic_shape() {
+        for (openai, expect) in [
+            ("none", json!({"type": "none"})),
+            ("required", json!({"type": "any"})),
+            ("auto", json!({"type": "auto"})),
+        ] {
+            let raw = format!(
+                r#"{{"model":"m","tools":[{{"type":"function","function":{{"name":"f","parameters":{{"type":"object"}}}}}}],"tool_choice":"{openai}","messages":[{{"role":"user","content":"x"}}]}}"#
+            );
+            let a = body_to_anthropic(raw.as_bytes()).unwrap();
+            assert_eq!(a["tool_choice"], expect, "{openai}");
+        }
     }
 
     #[test]

@@ -5411,7 +5411,7 @@ dependencies = [
 
 [[package]]
 name = "zcode-pool"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5428,7 +5428,7 @@ dependencies = [
 
 [[package]]
 name = "zcode-pool-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
