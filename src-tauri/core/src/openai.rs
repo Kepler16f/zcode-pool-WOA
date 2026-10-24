@@ -162,18 +162,41 @@ pub fn body_to_anthropic(raw: &[u8]) -> Result<Value, String> {
     //    上游据此返回 thinking 块，再由 resp_to_openai / StreamTee 翻成 reasoning_content。
     // 2) 仅有 OpenAI 的 `reasoning_effort`（"low/medium/high/max/auto" 之类）时，按档位映射出
     //    Anthropic 预算（见 effort_to_budget）；"none/off/disabled" 则明确不开思考。
+    // 关键语义：思考与正文**同计入** max_tokens（Anthropic 硬约束 budget < max_tokens）。旧实现
+    // 把超大的档位预算压到 max_tokens-1024——思考吃光正文额度：高档位下正文几百 token 就被
+    // finish_reason=length 拦腰截，模型还开始把没说完的思考当正文输出（装机症状：思考串正文
+    // ＋会话半截断）。改为**总是**扩总包保住正文全额：上游 max_tokens = 客户端正文额度 + 档位
+    // 预算；且顶到**应用内声明的单轮上限**（可选字段 max_output_tokens_hard_cap，用户点名
+    // "设置了上限就跟随上限"）——没有声明才用 65536 兜底。cap 紧到装不下时缩的是总包不是档位。
     let native_thinking = obj
         .get("thinking")
         .filter(|t| t.get("type").and_then(Value::as_str).is_some())
         .is_some();
+    let hard_cap = obj
+        .get("max_output_tokens_hard_cap")
+        .and_then(Value::as_u64);
     if let Some(t) = obj.get("thinking") {
         if t.get("type").and_then(Value::as_str).is_some() {
+            // 原生 thinking：预算与 max_tokens 冲突（budget ≥ max 上游必 400）时同样扩包不砍预算。
+            if t.get("type").and_then(Value::as_str).is_some_and(|s| s.eq_ignore_ascii_case("enabled"))
+                && t.get("budget_tokens").and_then(Value::as_u64).is_some()
+            {
+                let b = t["budget_tokens"].as_u64().unwrap();
+                let client_max = map["max_tokens"].as_u64().unwrap_or(8192);
+                if b >= client_max {
+                    map.insert("max_tokens".into(), json!(expand_output_budget(b, client_max, hard_cap)));
+                }
+            }
             map.insert("thinking".into(), t.clone());
         }
     }
     if !native_thinking {
-        let max_tokens = map["max_tokens"].as_u64().unwrap_or(8192);
-        if let Some(budget) = effort_to_budget(obj.get("reasoning_effort").and_then(Value::as_str), max_tokens) {
+        if let Some(base) = effort_to_budget(obj.get("reasoning_effort").and_then(Value::as_str)) {
+            let client_max = map["max_tokens"].as_u64().unwrap_or(8192);
+            // 总是扩包：正文全额=客户端 max_tokens，思考在其上叠加；总顶=应用声明的硬顶 ?? 65536。
+            let expanded = expand_output_budget(base, client_max, hard_cap);
+            let budget = base.min(expanded.saturating_sub(1024).max(1024));
+            map.insert("max_tokens".into(), json!(expanded));
             map.insert("thinking".into(), json!({"type": "enabled", "budget_tokens": budget}));
         }
     }
@@ -187,29 +210,39 @@ pub fn body_to_anthropic(raw: &[u8]) -> Result<Value, String> {
     Ok(anthropic)
 }
 
-/// OpenAI `reasoning_effort` 档位 → Anthropic thinking 的 budget_tokens。
+/// OpenAI `reasoning_effort` 档位 → Anthropic thinking 的 budget_tokens（档位基准值）。
 /// 返回 None 表示不开思考：没带档位、或明确 none/off/disabled（大小写不敏感、trim）。
 /// 档位基准：low=2048、medium/auto=8192、high=16384、max 及其他已知高档=32768；
-/// 未知档位按 medium 兜底。Anthropic 硬约束 budget_tokens < max_tokens：不满足时压到
-/// max_tokens-1024（下限 1024，恰为 Anthropic 最小思考预算）。
-fn effort_to_budget(effort: Option<&str>, max_tokens: u64) -> Option<u64> {
+/// 未知档位按 medium 兜底。**不再对 max_tokens 做钳制**——档位预算是用户意图，压掉它
+/// 等于用思考吞正文额度（截断+思考串正文）；总包由 expand_output_budget 扩容保证。
+fn effort_to_budget(effort: Option<&str>) -> Option<u64> {
     let raw = effort?.trim();
     if raw.is_empty() {
         return None;
     }
-    let base = match raw.to_ascii_lowercase().as_str() {
+    Some(match raw.to_ascii_lowercase().as_str() {
         "none" | "off" | "disabled" => return None,
         "low" | "minimal" => 2048,
         "medium" | "auto" => 8192,
         "high" => 16384,
         "max" | "xhigh" | "ultra" | "highest" => 32768,
         _ => 8192,
-    };
-    Some(if base < max_tokens {
-        base
-    } else {
-        max_tokens.saturating_sub(1024).max(1024)
     })
+}
+
+/// 开思考后的上游总包：正文全额（client_max）＋ 思考预算（budget）叠加。**上限纪律**：
+/// 客户端随请求声明了单轮硬顶（max_output_tokens_hard_cap）就跟随它（用户点名），
+/// 没有声明才用 65536 兜底（GLM 5 系官方 64k/128k，端侧常规传 8k–16k 时不会越顶）。
+/// 极端情况（顶比预算还矮一截）退到 budget+1024 保 Anthropic 的 budget < max_tokens 硬约束，
+/// 绝不反过来砍档位预算。
+fn expand_output_budget(budget: u64, client_max: u64, hard_cap: Option<u64>) -> u64 {
+    let wanted = budget.saturating_add(client_max).max(budget.saturating_add(1024));
+    let capped = wanted.min(hard_cap.unwrap_or(65_536));
+    if capped > budget {
+        capped
+    } else {
+        budget.saturating_add(1024)
+    }
 }
 
 fn push_text(into: &mut Vec<String>, v: &Value) {
@@ -525,26 +558,63 @@ mod tests {
 
     #[test]
     fn reasoning_effort_maps_to_thinking_budget() {
-        // high + 充裕 max_tokens：满额 16384 预算，且 < max_tokens。
+        // high + 充裕 max_tokens：档位预算满额保留（不被压），总包扩到 预算+正文。
         let raw = r#"{"model":"m","reasoning_effort":"high","max_tokens":40000,"messages":[{"role":"user","content":"x"}]}"#;
         let a = body_to_anthropic(raw.as_bytes()).unwrap();
         assert_eq!(a["thinking"]["type"], json!("enabled"));
         assert_eq!(a["thinking"]["budget_tokens"], json!(16384));
         let budget = a["thinking"]["budget_tokens"].as_u64().unwrap();
         assert!(budget < a["max_tokens"].as_u64().unwrap());
-        // high + 缺省 max_tokens=8192：预算压到 max_tokens-1024=7168，仍 < max_tokens；档位大写也识别。
+        // 正文额度必须原样保留：扩容出的差额只给思考，不再砍档位预算（装机症状的回归钉）。
+        assert_eq!(a["max_tokens"].as_u64().unwrap() - budget, 40000);
+        // high + 缺省 max_tokens=8192：预算满额 16384 保留，总包扩到 24576（正文仍占 8192）；档位大写也识别。
         let raw2 = r#"{"model":"m","reasoning_effort":"HIGH","messages":[{"role":"user","content":"x"}]}"#;
         let b = body_to_anthropic(raw2.as_bytes()).unwrap();
-        assert_eq!(b["thinking"]["budget_tokens"], json!(7168));
-        assert!(b["thinking"]["budget_tokens"].as_u64().unwrap() < b["max_tokens"].as_u64().unwrap());
+        assert_eq!(b["thinking"]["budget_tokens"], json!(16384));
+        assert_eq!(b["max_tokens"], 24576);
+    }
+
+    #[test]
+    fn effort_max_tier_expansion_hard_capped() {
+        // max 档 32768 + 正文 40000 = 72768 越兜底顶 → 钳到 65536；预算满额保留，仍 < max_tokens。
+        let raw = r#"{"model":"m","reasoning_effort":"max","max_tokens":40000,"messages":[{"role":"user","content":"x"}]}"#;
+        let a = body_to_anthropic(raw.as_bytes()).unwrap();
+        assert_eq!(a["thinking"]["budget_tokens"], json!(32768));
+        assert_eq!(a["max_tokens"], 65536);
+    }
+
+    #[test]
+    fn effort_expansion_follows_app_declared_cap() {
+        // 用户点名"应用内设置了上限就跟随上限"：客户端带 max_output_tokens_hard_cap 时，
+        // 扩包的顶 = 声明值（哪怕它比 65536 兜底顶更高或更低），档位预算只在顶不够时让位。
+        let raw = r#"{"model":"m","reasoning_effort":"high","max_tokens":16384,"max_output_tokens_hard_cap":20000,"messages":[{"role":"user","content":"x"}]}"#;
+        let a = body_to_anthropic(raw.as_bytes()).unwrap();
+        assert_eq!(a["max_tokens"], 20000);
+        assert!(a["thinking"]["budget_tokens"].as_u64().unwrap() < 20000);
+        // 声明值大于兜底顶时跟随声明值（128k 档模型），不再被 65536 拦住。
+        let raw2 = r#"{"model":"m","reasoning_effort":"max","max_tokens":64000,"max_output_tokens_hard_cap":131072,"messages":[{"role":"user","content":"x"}]}"#;
+        let b = body_to_anthropic(raw2.as_bytes()).unwrap();
+        assert_eq!(b["max_tokens"], 96768);
+        assert_eq!(b["thinking"]["budget_tokens"], json!(32768));
     }
 
     #[test]
     fn native_thinking_not_overridden_by_effort() {
-        // 原生 thinking 对象优先级高于档位映射：原样透传、不被覆盖。
+        // 原生 thinking 对象优先级高于档位映射：原样透传、不被覆盖（预算没越界时 max_tokens 也不动）。
         let raw = r#"{"model":"m","reasoning_effort":"high","thinking":{"type":"enabled","budget_tokens":1234},"messages":[{"role":"user","content":"x"}]}"#;
         let a = body_to_anthropic(raw.as_bytes()).unwrap();
         assert_eq!(a["thinking"], json!({"type":"enabled","budget_tokens":1234}));
+        assert_eq!(a["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn native_thinking_oversized_budget_expands_max() {
+        // 客户端自带 thinking 的预算 ≥ max_tokens 时同样扩总包（上游硬约束 budget<max 必须满足），
+        // 但绝不改客户端的 thinking 本体。
+        let raw = r#"{"model":"m","thinking":{"type":"enabled","budget_tokens":20000},"messages":[{"role":"user","content":"x"}]}"#;
+        let a = body_to_anthropic(raw.as_bytes()).unwrap();
+        assert_eq!(a["thinking"], json!({"type":"enabled","budget_tokens":20000}));
+        assert_eq!(a["max_tokens"], 28192);
     }
 
     #[test]
