@@ -157,6 +157,26 @@ pub fn body_to_anthropic(raw: &[u8]) -> Result<Value, String> {
             map.insert(k.into(), x.clone());
         }
     }
+    // 思维链开关：优先级为 原生 thinking 对象 > reasoning_effort 档位映射 > 不开思考。
+    // 1) 客户端若已带 Anthropic 形 `thinking`（{"type":"enabled","budget_tokens":N}）则原样转发，
+    //    上游据此返回 thinking 块，再由 resp_to_openai / StreamTee 翻成 reasoning_content。
+    // 2) 仅有 OpenAI 的 `reasoning_effort`（"low/medium/high/max/auto" 之类）时，按档位映射出
+    //    Anthropic 预算（见 effort_to_budget）；"none/off/disabled" 则明确不开思考。
+    let native_thinking = obj
+        .get("thinking")
+        .filter(|t| t.get("type").and_then(Value::as_str).is_some())
+        .is_some();
+    if let Some(t) = obj.get("thinking") {
+        if t.get("type").and_then(Value::as_str).is_some() {
+            map.insert("thinking".into(), t.clone());
+        }
+    }
+    if !native_thinking {
+        let max_tokens = map["max_tokens"].as_u64().unwrap_or(8192);
+        if let Some(budget) = effort_to_budget(obj.get("reasoning_effort").and_then(Value::as_str), max_tokens) {
+            map.insert("thinking".into(), json!({"type": "enabled", "budget_tokens": budget}));
+        }
+    }
     if let Some(stop) = obj.get("stop") {
         match stop {
             Value::String(s) => map.insert("stop_sequences".into(), json!([s])),
@@ -165,6 +185,31 @@ pub fn body_to_anthropic(raw: &[u8]) -> Result<Value, String> {
         };
     }
     Ok(anthropic)
+}
+
+/// OpenAI `reasoning_effort` 档位 → Anthropic thinking 的 budget_tokens。
+/// 返回 None 表示不开思考：没带档位、或明确 none/off/disabled（大小写不敏感、trim）。
+/// 档位基准：low=2048、medium/auto=8192、high=16384、max 及其他已知高档=32768；
+/// 未知档位按 medium 兜底。Anthropic 硬约束 budget_tokens < max_tokens：不满足时压到
+/// max_tokens-1024（下限 1024，恰为 Anthropic 最小思考预算）。
+fn effort_to_budget(effort: Option<&str>, max_tokens: u64) -> Option<u64> {
+    let raw = effort?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let base = match raw.to_ascii_lowercase().as_str() {
+        "none" | "off" | "disabled" => return None,
+        "low" | "minimal" => 2048,
+        "medium" | "auto" => 8192,
+        "high" => 16384,
+        "max" | "xhigh" | "ultra" | "highest" => 32768,
+        _ => 8192,
+    };
+    Some(if base < max_tokens {
+        base
+    } else {
+        max_tokens.saturating_sub(1024).max(1024)
+    })
 }
 
 fn push_text(into: &mut Vec<String>, v: &Value) {
@@ -191,6 +236,7 @@ fn push_text(into: &mut Vec<String>, v: &Value) {
 /// Anthropic JSON 响应 → chat.completion。非 OpenAI 上游错误保持原样透传。
 pub fn resp_to_openai(resp: &Value) -> Value {
     let mut content = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     if let Some(blocks) = resp.get("content").and_then(Value::as_array) {
         for b in blocks {
@@ -201,6 +247,15 @@ pub fn resp_to_openai(resp: &Value) -> Value {
                             content.push('\n');
                         }
                         content.push_str(t);
+                    }
+                }
+                // Anthropic 思维块（type=="thinking"，字段 thinking）→ reasoning_content。
+                Some("thinking") => {
+                    if let Some(t) = b.get("thinking").and_then(Value::as_str) {
+                        if !reasoning.is_empty() {
+                            reasoning.push_str("\n\n");
+                        }
+                        reasoning.push_str(t);
                     }
                 }
                 Some("tool_use") => {
@@ -218,6 +273,9 @@ pub fn resp_to_openai(resp: &Value) -> Value {
         }
     }
     let mut msg = json!({"role": "assistant", "content": if content.is_empty() { Value::Null } else { json!(content) }});
+    if !reasoning.is_empty() {
+        msg["reasoning_content"] = json!(reasoning);
+    }
     if !tool_calls.is_empty() {
         msg["tool_calls"] = json!(tool_calls);
     }
@@ -341,6 +399,13 @@ impl<R: Read> StreamTee<R> {
                             }]}, "finish_reason": null})));
                         }
                     }
+                    // Anthropic 思维链增量（delta.thinking）→ OpenAI chunk 的 reasoning_content。
+                    // signature_delta（思维块签名）忽略：客户端不需要、OpenAI 无对应字段。
+                    Some("thinking_delta") => {
+                        if let Some(t) = d.get("thinking").and_then(Value::as_str) {
+                            self.chunk(self.base(json!({"index": 0, "delta": {"reasoning_content": t}, "finish_reason": null})));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -459,6 +524,44 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_maps_to_thinking_budget() {
+        // high + 充裕 max_tokens：满额 16384 预算，且 < max_tokens。
+        let raw = r#"{"model":"m","reasoning_effort":"high","max_tokens":40000,"messages":[{"role":"user","content":"x"}]}"#;
+        let a = body_to_anthropic(raw.as_bytes()).unwrap();
+        assert_eq!(a["thinking"]["type"], json!("enabled"));
+        assert_eq!(a["thinking"]["budget_tokens"], json!(16384));
+        let budget = a["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert!(budget < a["max_tokens"].as_u64().unwrap());
+        // high + 缺省 max_tokens=8192：预算压到 max_tokens-1024=7168，仍 < max_tokens；档位大写也识别。
+        let raw2 = r#"{"model":"m","reasoning_effort":"HIGH","messages":[{"role":"user","content":"x"}]}"#;
+        let b = body_to_anthropic(raw2.as_bytes()).unwrap();
+        assert_eq!(b["thinking"]["budget_tokens"], json!(7168));
+        assert!(b["thinking"]["budget_tokens"].as_u64().unwrap() < b["max_tokens"].as_u64().unwrap());
+    }
+
+    #[test]
+    fn native_thinking_not_overridden_by_effort() {
+        // 原生 thinking 对象优先级高于档位映射：原样透传、不被覆盖。
+        let raw = r#"{"model":"m","reasoning_effort":"high","thinking":{"type":"enabled","budget_tokens":1234},"messages":[{"role":"user","content":"x"}]}"#;
+        let a = body_to_anthropic(raw.as_bytes()).unwrap();
+        assert_eq!(a["thinking"], json!({"type":"enabled","budget_tokens":1234}));
+    }
+
+    #[test]
+    fn effort_off_or_absent_means_no_thinking() {
+        // none/off/disabled（大小写不敏感、带空格）→ 明确不开思考。
+        for eff in ["none", " Off ", "DISABLED"] {
+            let raw = format!(r#"{{"model":"m","reasoning_effort":"{eff}","messages":[{{"role":"user","content":"x"}}]}}"#);
+            let a = body_to_anthropic(raw.as_bytes()).unwrap();
+            assert!(a.get("thinking").is_none(), "{eff} 应关闭思考");
+        }
+        // 既无 thinking 又无 reasoning_effort：行为不变（不开思考）。
+        let raw = r#"{"model":"m","messages":[{"role":"user","content":"x"}]}"#;
+        let a = body_to_anthropic(raw.as_bytes()).unwrap();
+        assert!(a.get("thinking").is_none());
+    }
+
+    #[test]
     fn tool_round_trip_blocks() {
         let raw = r#"{"model":"gpt","messages":[
             {"role":"user","content":"几点?"},
@@ -496,6 +599,38 @@ mod tests {
         assert_eq!(o["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(o["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "{\"a\":1}");
         assert_eq!(o["usage"]["total_tokens"], 15);
+    }
+
+    #[test]
+    fn resp_thinking_to_reasoning_content() {
+        let resp = json!({"id":"msg_1","model":"glm-5.3","content":[
+            {"type":"thinking","thinking":"先想一下","signature":"sig"},
+            {"type":"text","text":"结果"}
+        ],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}});
+        let o = resp_to_openai(&resp);
+        assert_eq!(o["choices"][0]["message"]["content"], "结果");
+        assert_eq!(o["choices"][0]["message"]["reasoning_content"], "先想一下");
+    }
+
+    #[test]
+    fn stream_thinking_delta_to_reasoning_content() {
+        let sse = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"glm-5.3\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"让我想想\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"abc\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"答案\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut tee = StreamTee::new(sse.as_bytes());
+        let mut out = Vec::new();
+        tee.read_to_end(&mut out).unwrap();
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(text.contains("\"reasoning_content\":\"让我想想\""), "{text}");
+        assert!(text.contains("\"content\":\"答案\""), "{text}");
+        // signature_delta 不应产生任何输出
+        assert!(!text.contains("abc"), "{text}");
     }
 
     #[test]
