@@ -37,13 +37,20 @@ jobs:
 
       - run: npm install
 
+      # 版本号从 package.json 读，不写死 —— 写死会导致构建出的包（1.0.1）挂在
+      # 旧版本号的 release（v1.0.0）下，下载的人容易装错包。
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "v=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
       - name: Build & attach to Release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v1.0.0' }}
-          releaseName: "Z·POOL ${{ github.ref_type == 'tag' && github.ref_name || 'v1.0.0' }} (Windows ARM64)"
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || steps.ver.outputs.v }}
+          releaseName: "Z·POOL ${{ github.ref_type == 'tag' && github.ref_name || steps.ver.outputs.v }} (Windows ARM64)"
           releaseBody: |
             ZCode 账号池 · Windows on ARM fork（zcode-pool-WOA）
 
@@ -57,6 +64,13 @@ jobs:
               修复国内出口下登录被重定向到国内版、邮箱登录不可用的问题。
             - **ZCode 安装路径探测修复**：反代抽取系统提示词时补扫 `C:\Program Files (x86)\ZCode\`，
               修复 x64 版 ZCode 装在 (x86) 目录（ARM64 设备上的常见落点）时反代本地 503 的问题。
+            - **局域网共享与 API Key 管理**：设置页直接管理 —— 允许局域网设备访问（开关）、
+              生成/复制/删除 API Key、一键复制客户端配置实例（Base URL + Anthropic/OpenAI 端点）。
+            - **账号包跨设备可移植**：导出时把 ZCode 的机器绑定密文解平成明文（ZCode 的密文密钥
+              派生自 `platform:home:username`，换机解不开 → 手机端号全部"没登录" → 反代报
+              `no-account` / 话没说完就断）。现在 PC 导出的包导到手机可直接用。
+            - **反代 502 归因**：`no-account` 不再只说"没有可用的号"，会具体指出是
+              凭据解不开 / 该模型无额度 / 限流或 3012 冷却 / 号刚被截断降级。
 
             本 fork 仅构建 Windows ARM64 安装包；其他平台请使用上游
             [Limitinfinitude/zcode-pool](https://github.com/Limitinfinitude/zcode-pool/releases) 的发布。
