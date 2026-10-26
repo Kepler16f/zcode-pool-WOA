@@ -196,3 +196,60 @@ pub fn identity_with_secret(creds: &Value, secret: &str) -> Identity {
 pub fn account_identity(creds: &Value, home: &Path) -> Identity {
     identity_with_secret(creds, &default_secret(home))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 与 ZCode 同格式造一个 enc:v1 密文（测试专用，固定 nonce 便于复现）。
+    fn enc_for_test(plain: &str, secret: &str) -> String {
+        let key = derive_key(secret);
+        let cipher = Aes256Gcm::new_from_slice(&key).expect("aes key len");
+        let nonce_bytes = [7u8; 12];
+        let mut sealed = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plain.as_bytes())
+            .expect("encrypt");
+        let tag = sealed.split_off(sealed.len() - 16);
+        format!(
+            "{PREFIX}{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(nonce_bytes),
+            URL_SAFE_NO_PAD.encode(&tag),
+            URL_SAFE_NO_PAD.encode(&sealed)
+        )
+    }
+
+    #[test]
+    fn deep_decrypt_flattens_nested_enc_values() {
+        let secret = "s3cret-A";
+        let v = json!({
+            "zcodejwttoken": enc_for_test("token-plain", secret),
+            "oauth:zai:access_token": enc_for_test("at-plain", secret),
+            "plain": "already-plain",
+            "nested": { "deep": enc_for_test("deep-plain", secret) },
+            "arr": [enc_for_test("in-arr", secret), 7],
+        });
+        let out = decrypt_value_deep(&v, secret);
+        assert_eq!(out["zcodejwttoken"], json!("token-plain"));
+        assert_eq!(out["oauth:zai:access_token"], json!("at-plain"));
+        assert_eq!(out["plain"], json!("already-plain"));
+        assert_eq!(out["nested"]["deep"], json!("deep-plain"));
+        assert_eq!(out["arr"][0], json!("in-arr"));
+        assert_eq!(out["arr"][1], json!(7));
+    }
+
+    #[test]
+    fn deep_decrypt_keeps_undecryptable_value_verbatim() {
+        // 别的机器的密钥 → 解不开；必须原样保留（不丢数据），而不是清空
+        let v = json!({ "zcodejwttoken": enc_for_test("token-plain", "other-machine-secret") });
+        let out = decrypt_value_deep(&v, "my-secret");
+        assert!(out["zcodejwttoken"].as_str().unwrap().starts_with(PREFIX));
+        assert_eq!(out["zcodejwttoken"], v["zcodejwttoken"]);
+    }
+
+    #[test]
+    fn deep_decrypt_leaves_plaintext_untouched() {
+        let v = json!({ "a": "plain", "b": { "c": "plain2" } });
+        assert_eq!(decrypt_value_deep(&v, "any"), v);
+    }
+}
