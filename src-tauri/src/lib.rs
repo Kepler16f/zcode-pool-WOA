@@ -295,17 +295,31 @@ fn claim_start_inner(
     let paths = Paths::detect();
     let mid = store::account_mid(&paths, &id)?;
     let acc = load_account(&paths, &id)?;
-    let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid.clone()))?;
-    let plan = plans
-        .iter()
-        .find(|p| p.plan_id == plan_id)
-        .ok_or_else(|| i18n::tr("err.claim.gone"))?;
-    let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
+    // 上游 2026-11 起对一部分账号 preview 直接不返回 data（活动列表拿不到），但
+    // billing/claim 本身仍按 plan_id 受理（先校验证码、再校资格，无效 plan_id 会被上游拒绝）。
+    // 所以：预览里找不到、但调用方显式给了 plan_id 时放行 —— 让上游自己做资格校验；
+    // 只有"没给 plan_id 且预览为空"才报「已不可领取」。
+    let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid.clone()))
+        .unwrap_or_default();
+    let plan_id_trim = plan_id.trim().to_string();
+    let (pending_plan_id, display) = match plans.iter().find(|p| p.plan_id == plan_id) {
+        Some(p) => (
+            p.plan_id.clone(),
+            if p.name.is_empty() { p.plan_id.clone() } else { p.name.clone() },
+        ),
+        None => {
+            if plan_id_trim.is_empty() {
+                return Err(i18n::tr("err.claim.gone"));
+            }
+            flowlog::log("claim", "manual-plan", &format!("预览未列出，按显式 plan_id 领取: {plan_id_trim}"));
+            (plan_id_trim.clone(), plan_id_trim.clone())
+        }
+    };
 
     *pending_guard() = Some(PendingClaim {
         account_id: acc.id.clone(),
         account_name: acc.name.clone(),
-        plan_id: plan.plan_id.clone(),
+        plan_id: pending_plan_id,
         plan_name: display.clone(),
         credentials: acc.credentials,
         config: acc.config,

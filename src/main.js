@@ -596,6 +596,13 @@ const actions = {
       toast(t("s.clientVersionCleared"), "ok");
     } catch (e) { toast(stripErr(e), "err"); }
   },
+  saveManualPlan() {
+    const input = document.getElementById("manual-plan-id");
+    if (!input) return;
+    setManualPlanId(input.value);
+    render();
+    toast(t("m.manualPlanSaved"), "ok");
+  },
   acctQuota(id) {
     const dueAt = quotaDue[id];
     loadAcctQuota(id).then(() => {
@@ -652,11 +659,16 @@ const actions = {
     if (claimActive || claimAllRunning || refreshClaim.running) { toast(t("m.claimBusy"), "warn"); return; }
     const plans = claimable[id]?.plans || [];
     const plan = plans[0];
-    if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
+    // 上游 2026-11 起 preview 对部分账号不再返回活动列表；显式手动套餐 ID 兜底领取
+    // （后端已放行：预览未列出但显式给 plan_id 时直接受理，由上游 claim 接口校验资格）。
+    const manual = manualPlanId();
+    if (!plan && !manual) { toast(t("m.noClaimable"), "warn"); return; }
+    const planId = plan ? plan.plan_id : manual;
+    const planName = plan ? (plan.name || plan.plan_id) : manual;
     claimActive = true;
     try {
-      await beginClaim({ id, planId: plan.plan_id });
-      toast(t("m.claimVerify", { name: plan.name || plan.plan_id }), "ok", t("m.claimVerifyDetail"));
+      await beginClaim({ id, planId });
+      toast(t("m.claimVerify", { name: planName }), "ok", t("m.claimVerifyDetail"));
       const r = await waitForClaimResult(id);
       if (!r) toast(t("m.claimTimeout"), "warn");
     } catch (e) {
@@ -986,10 +998,29 @@ function grantLabel(plan) {
   }
   return (plan.grants || [])[0] || "";
 }
+// 手动套餐 ID：上游 2026-11 起 preview 对部分账号不返回活动列表，但 billing/claim 仍按
+// plan_id 受理。把已知的活动 plan_id 存 localStorage，即可在没有预览列表时兜底领取。
+const MANUAL_PLAN_KEY = "zpool.manualPlanId";
+function manualPlanId() {
+  try { return (localStorage.getItem(MANUAL_PLAN_KEY) || "").trim(); } catch { return ""; }
+}
+function setManualPlanId(v) {
+  try { localStorage.setItem(MANUAL_PLAN_KEY, (v || "").trim()); } catch {}
+}
 function claimStripHtml(id) {
   const c = claimable[id];
   const plan = c?.plans?.[0];
-  if (!plan) return "";
+  if (!plan) {
+    const manual = manualPlanId();
+    if (!manual) return "";
+    return `
+  <div class="claim-strip" title="${esc(t("m.manualPlanHint"))}">
+    ${ic("gift", 15)}
+    <span class="claim-name">${esc(manual)}</span>
+    <span class="claim-grants">${esc(t("m.manualPlanTag"))}</span>
+    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
+  </div>`;
+  }
   const grants = grantLabel(plan);
   const label = plan.name || plan.plan_id;
   return `
@@ -1585,6 +1616,9 @@ function render() {
           ? `<button class="btn-ghost has-ic" click="actions.launch()">${ic("play", 14)} ${t("btn.launchZcode")}</button>`
           : `<button class="btn-ghost has-ic" click="actions.openSettings()" title="${esc(t("btn.zcodePathBad", { path: s.zcode_path || "-" }))}">${ic("alert", 14)} ${t("btn.fixZcodePath")}</button>`}
         <span class="tb-spacer"></span>
+        <input class="list-filter manual-plan" id="manual-plan-id" type="text" autocomplete="off" spellcheck="false"
+             value="${esc(manualPlanId())}" placeholder="${t("m.manualPlanPh")}" title="${t("m.manualPlanHint")}"
+             keydown="onManualPlanKey(event)" style="max-width:250px">
         ${s.accounts.length >= 4
           ? `<input class="list-filter" id="list-filter" type="search" autocomplete="off" spellcheck="false"
                value="${esc(filter)}" placeholder="${t("m.filterPh")}" aria-label="${t("m.filterPh")}">`
@@ -1604,6 +1638,7 @@ setConsoleRerender(() => { if (!uiLocked() && !isEditing()) render(); });
 window.onPathKey = (e) => { if (e.key === "Enter") actions.savePath(); };
 window.onProxyKey = (e) => { if (e.key === "Enter") actions.saveProxy(); };
 window.onClientVersionKey = (e) => { if (e.key === "Enter") actions.saveClientVersion(); };
+window.onManualPlanKey = (e) => { if (e.key === "Enter") actions.saveManualPlan(); };
 window.onRenameKey = (e, id) => {
   if (e.key === "Enter") actions.doRename(id);
   if (e.key === "Escape") actions.cancelRename();
