@@ -21,6 +21,7 @@ let appVer = "";
 let autostart = false;
 let acctQuota = {};
 let claimable = {};
+let claimDiag = {};
 let claimAllRunning = false;
 let filter = "";
 let relayRefreshing = false;
@@ -655,22 +656,46 @@ const actions = {
     });
   },
 
+  async diagnoseClaim(id) {
+    try {
+      const d = await invoke("claim_diagnose", { id });
+      claimDiag[id] = d;
+      render();
+      toast(d.reason || "", d.credentialOk ? "ok" : "err");
+    } catch (e) { toast(stripErr(e), "err"); }
+  },
+
   async claim(id) {
     if (claimActive || claimAllRunning || refreshClaim.running) { toast(t("m.claimBusy"), "warn"); return; }
     const plans = claimable[id]?.plans || [];
     const plan = plans[0];
-    // 上游 2026-11 起 preview 对部分账号不再返回活动列表；显式手动套餐 ID 兜底领取
-    // （后端已放行：预览未列出但显式给 plan_id 时直接受理，由上游 claim 接口校验资格）。
     const manual = manualPlanId();
-    if (!plan && !manual) { toast(t("m.noClaimable"), "warn"); return; }
-    const planId = plan ? plan.plan_id : manual;
-    const planName = plan ? (plan.name || plan.plan_id) : manual;
+    // 候选顺序：预览里的套餐 → 手动指定的 ID → 自动探测的候选（按日期倒序）。
+    // 上游 2026-11 起 preview 对部分账号不再返回活动列表，此时**不要求手填活动 ID**：
+    // 自动探测拿候选逐个试；每个候选各走一次验证码（上游验证码参数是一次性的）。
+    let candidates = [];
+    if (plan) candidates.push(plan.plan_id);
+    else if (manual) candidates.push(manual);
+    else {
+      try { candidates = await invoke("claim_candidates"); } catch { candidates = []; }
+    }
+    if (!candidates.length) { toast(t("m.noClaimable"), "warn"); return; }
     claimActive = true;
     try {
-      await beginClaim({ id, planId });
-      toast(t("m.claimVerify", { name: planName }), "ok", t("m.claimVerifyDetail"));
-      const r = await waitForClaimResult(id);
-      if (!r) toast(t("m.claimTimeout"), "warn");
+      for (let i = 0; i < candidates.length; i++) {
+        const planId = candidates[i];
+        const isLast = i === candidates.length - 1;
+        await beginClaim({ id, planId });
+        toast(t("m.claimVerify", { name: plan ? (plan.name || plan.plan_id) : planId }), "ok", t("m.claimVerifyDetail"));
+        const r = await waitForClaimResult(id);
+        if (!r) { toast(t("m.claimTimeout"), "warn"); return; }
+        if (r.ok || r.code !== 1001) return;   // 领成了 / 遇到非 1001 的错 → 停
+        // 1001 = 这个候选不存在 → 试下一个（后端已把 rest 放在 nextCandidates）
+        if (isLast) return;
+        if (Array.isArray(r.nextCandidates) && r.nextCandidates.length) {
+          candidates = r.nextCandidates.concat(candidates.slice(i + 1));
+        }
+      }
     } catch (e) {
       toast(stripErr(e), "err");
     } finally {
@@ -999,7 +1024,8 @@ function grantLabel(plan) {
   return (plan.grants || [])[0] || "";
 }
 // 手动套餐 ID：上游 2026-11 起 preview 对部分账号不返回活动列表，但 billing/claim 仍按
-// plan_id 受理。把已知的活动 plan_id 存 localStorage，即可在没有预览列表时兜底领取。
+// plan_id 受理（回 1001 表示该套餐不存在）。默认走**自动探测**（后端按日期规律试候选），
+// 这里只是应急覆盖手段。
 const MANUAL_PLAN_KEY = "zpool.manualPlanId";
 function manualPlanId() {
   try { return (localStorage.getItem(MANUAL_PLAN_KEY) || "").trim(); } catch { return ""; }
@@ -1010,15 +1036,23 @@ function setManualPlanId(v) {
 function claimStripHtml(id) {
   const c = claimable[id];
   const plan = c?.plans?.[0];
+  const busy = claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning;
+  const btn = `<button class="btn-claim has-ic" click="actions.claim('${id}')" ${busy ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>`;
   if (!plan) {
+    // 没有预览列表也保留按钮：点击后由后端自动探测当前活动（一次验证码依次试候选），
+    // 不需要手填活动 ID。
     const manual = manualPlanId();
-    if (!manual) return "";
+    const diag = claimDiag[id];
+    const tag = manual ? esc(manual) : esc(t("m.autoProbeTag"));
+    const hint = manual ? esc(t("m.manualPlanHint")) : esc(t("m.autoProbeHint"));
+    const why = diag?.reason ? `<span class="claim-grants">${esc(diag.reason)}</span>` : "";
     return `
-  <div class="claim-strip" title="${esc(t("m.manualPlanHint"))}">
+  <div class="claim-strip" title="${hint}">
     ${ic("gift", 15)}
-    <span class="claim-name">${esc(manual)}</span>
-    <span class="claim-grants">${esc(t("m.manualPlanTag"))}</span>
-    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
+    <span class="claim-name">${tag}</span>
+    ${why || `<span class="claim-grants">${hint}</span>`}
+    ${btn}
+    <button class="btn-ghost has-ic" click="actions.diagnoseClaim('${id}')">${ic("refresh", 13)} ${t("m.diagBtn")}</button>
   </div>`;
   }
   const grants = grantLabel(plan);
@@ -1028,7 +1062,7 @@ function claimStripHtml(id) {
     ${ic("gift", 15)}
     <span class="claim-name">${esc(label)}</span>
     ${grants ? `<span class="claim-grants">${esc(grants)}</span>` : ""}
-    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
+    ${btn}
   </div>`;
 }
 

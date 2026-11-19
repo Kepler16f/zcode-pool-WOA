@@ -879,9 +879,15 @@ pub fn query_quota_mid(tokens: &[String], mid: Option<&str>) -> Result<QuotaOver
         }
         return Err(crate::i18n::tr("err.token.expired"));
     }
-    Err(first_business.or(last_err).unwrap_or_else(|| crate::i18n::tr("err.quota.fail")))
+Err(first_business.or(last_err).unwrap_or_else(|| crate::i18n::tr("err.quota.fail")))
 }
 
+/// 探测某个 token 在计费接口上是否还有效（能拿到 200 响应即视为有效）。
+/// 用于区分「号/凭据坏了」与「上游此刻没活动」——两者在面板上都表现为空列表。
+pub fn probe_billing_credential(token: &str, mid: Option<&str>) -> Result<(), String> {
+    let url = format!("{BILLING_BALANCE_URL}?app_version={}", zcode_app_version());
+    http_get_json_mid(&url, token, false, mid).map(|_| ())
+}
 fn unit_label(unit: Option<i64>, number: Option<i64>) -> (String, String) {
     match unit {
         Some(3) => {

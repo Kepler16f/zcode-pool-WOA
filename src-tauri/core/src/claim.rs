@@ -10,6 +10,9 @@ pub const BILLING_CLAIM_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billin
 pub const CLIENT_CONFIGS_URL: &str = "https://zcode.z.ai/api/v1/client/configs";
 
 const CLAIM_TIMEOUT_SECS: u64 = 25;
+/// 候选探测的间隔与 429 退避（上游对同号连续 claim 会限流）。
+const CANDIDATE_GAP_MS: u64 = 1_500;
+const CANDIDATE_RETRY_MS: u64 = 8_000;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ClaimGrant {
@@ -251,6 +254,138 @@ pub fn preview_plans(
         quota::client_platform()
     );
     preview_once(&url, &token, device_mid)
+}
+
+/// 活动套餐 id 的候选生成。
+///
+/// 上游 2026-11 起，`billing/preview` 对部分账号不再返回 `data`（活动列表拿不到），
+/// 但 `billing/claim` 仍按 `plan_id` 受理——无效 id 会回 1001「套餐不存在」。
+/// 于是没有预览列表时，可以按命名规律（`zcode-v3-start-plan-<MMDD>`，MMDD = 上线日）
+/// 造出候选，让调用方逐个探测。
+///
+/// 依据：官方客户端本地缓存里 2026-11 的活动是 `zcode-v3-start-plan-1118`
+/// （上线 11-18，有效期 14 小时），基础包是 `zcode-v3-start-plan`。
+pub fn candidate_plan_ids(days_back: u32, days_forward: u32) -> Vec<String> {
+    use chrono::{Datelike, Duration, Local};
+    let today = Local::now().date_naive();
+    let mut out = Vec::new();
+    for d in -(days_back as i64)..=(days_forward as i64) {
+        let naive = today + Duration::days(d);
+        out.push(format!(
+            "zcode-v3-start-plan-{:02}{:02}",
+            naive.month(),
+            naive.day()
+        ));
+    }
+    out.reverse(); // 越新越前
+    out
+}
+
+/// 预览接口的诊断结果。
+///
+/// 关键区分（2026-11-19 排查结论）：
+/// - `data` 字段**整个不存在** → 上游改版后不再对该账号返回活动列表（客户端绕不过去）。
+/// - `data.plans` 是**空数组** → 上游正常响应，只是此刻没有可领的活动。
+/// 两者都拿不到时，用 `billing/balance` 侧证：它返回 200 + 空列表说明**账号凭据有效**，
+/// 只是当下没活动；连 balance 都 401/失败才是号/凭据的问题。
+pub struct PreviewDiag {
+    /// 上游是否返回了 data 字段
+    pub has_data: bool,
+    /// 预览到的套餐数
+    pub plan_count: usize,
+    /// 账号凭据是否仍然有效（balance 接口可达即有效）
+    pub credential_ok: bool,
+    /// 给人看的结论
+    pub reason: String,
+}
+
+/// 诊断"为什么领不到"：预览 + 余额双探针。
+pub fn diagnose_claimable(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: Option<String>,
+) -> PreviewDiag {
+    let secret = zcrypto::default_secret(home);
+    let token = match claim_token(creds, config, &secret) {
+        Ok(t) => t,
+        Err(_) => {
+            return PreviewDiag {
+                has_data: false,
+                plan_count: 0,
+                credential_ok: false,
+                reason: crate::i18n::tr("err.claim.no_jwt"),
+            }
+        }
+    };
+    let ver = quota::zcode_app_version();
+    let plat = quota::client_platform();
+
+    // ① 预览
+    let preview_url = format!("{BILLING_PREVIEW_URL}?app_version={ver}&platform={plat}");
+    let mut has_data = false;
+    let mut plan_count = 0usize;
+    if let Ok(v) = preview_once(&preview_url, &token, device_mid.clone()) {
+        has_data = true;
+        plan_count = v.len();
+    }
+
+    // ② 余额侧证：能返回 200 即凭据有效
+    let credential_ok =
+        quota::probe_billing_credential(&token, device_mid.as_deref()).is_ok();
+
+    let reason = if plan_count > 0 {
+        crate::i18n::tr("m.diag.hasPlans")
+    } else if !has_data && credential_ok {
+        crate::i18n::tr("m.diag.noListButCredOk")
+    } else if !has_data {
+        crate::i18n::tr("m.diag.noListNoCred")
+    } else {
+        crate::i18n::tr("m.diag.noPlans")
+    };
+    PreviewDiag { has_data, plan_count, credential_ok, reason }
+}
+
+/// 一次验证码、多个候选 plan_id 依次尝试。
+///
+/// ⚠ 上游的验证码参数**是一次性的**：一张码只能提交一次，第二次会回 3007
+/// 「captcha verify failed」。所以**不能**在这里连着试多个候选 —— 必须每个候选
+/// 各走一次完整验证码流程（由前端循环驱动：claim_start → 验证码 → claim_captcha_submit）。
+/// 这个函数因此只保留给"同一张码重复提交"之外的场景，实际领取不走它。
+pub fn submit_claim_candidates(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    candidates: &[String],
+    captcha_param: &str,
+    captcha_region: Option<&str>,
+    device_mid: Option<String>,
+) -> Result<(String, Value), ClaimError> {
+    let mut last_err: Option<ClaimError> = None;
+    for plan_id in candidates {
+        match submit_claim(
+            home,
+            creds,
+            config,
+            plan_id,
+            captcha_param,
+            captcha_region,
+            device_mid.clone(),
+        ) {
+            Ok(v) => return Ok((plan_id.clone(), v)),
+            // 1001 = 套餐不存在：换下一个候选。
+            Err(e) if e.code == 1001 => {
+                crate::flowlog::log("claim", "candidate-miss", plan_id);
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| ClaimError {
+        code: 1001,
+        message: crate::i18n::tr("claim.fail.1001"),
+        next_at: None,
+    }))
 }
 
 fn http_err(prefix: &str, e: ureq::Error) -> String {

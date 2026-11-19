@@ -1199,18 +1199,32 @@ impl Gateway {
             }
         }
 
-        let server = tiny_http::Server::http(("0.0.0.0", port))
-            .map_err(|e| crate::i18n::trf("err.gw.bind", &[("e", &e.to_string())]))?;
+        // 端口可能「被占」也可能「被系统保留」：Windows 的 Hyper-V/WSL/Docker 会动态
+        // 保留一段端口（netsh interface ipv4 show excludedportrange），落在里面的端口
+        // 绑定会报 WSAEACCES(10013) 而不是「已被占用」(10048)。
+        // 这两种都不是配置错误 —— 换个端口照样能用，所以这里自动回退并记下来。
+        let (server, bound_port) = bind_with_fallback(port)?;
         let stop = Arc::new(AtomicBool::new(false));
         let serving = Arc::new(AtomicBool::new(true));
         let server = Arc::new(server);
         {
             let mut g = self.inner.lock().unwrap();
             g.running = true;
-            g.port = port;
+            g.port = bound_port;
             g.stop = Some(stop.clone());
             g.server = Some(server.clone());
             g.serving = Some(serving.clone());
+        }
+        if bound_port != port {
+            // 记到 settings：下次启动直接用这个端口，客户端配置也照它填。
+            if let Err(e) = store::set_relay_port(&paths, bound_port) {
+                crate::flowlog::log("relay", "port-save-fail", &e);
+            }
+            crate::flowlog::log(
+                "relay",
+                "port-fallback",
+                &format!("{port} 不可用（被系统保留或占用）→ 改用 {bound_port}"),
+            );
         }
         let gw = self.clone();
         let server2 = server.clone();
@@ -2188,6 +2202,45 @@ impl Health {
             "history": self.history.iter().map(|(t, m)| json!({ "at": t, "ms": m })).collect::<Vec<_>>(),
         })
     }
+}
+
+/// 绑定反代端口，必要时自动回退到邻近可用端口。
+///
+/// 背景（2026-11-19 实测）：Windows 的 Hyper-V/WSL/Docker 会动态保留一段端口
+/// （`netsh interface ipv4 show excludedportrange protocol=tcp`），落在保留段里的端口
+/// 绑定报 **WSAEACCES(10013)**，不是「已被占用」(10048)。本机当时保留段是 8776-8975，
+/// 正好盖住默认端口 8899 —— 池子整个起不来（面板里什么都查不到）。
+///
+/// 这里的行为：首选端口绑不上就在其后的候选里逐个试（跳过保留段），仍不行才报错；
+/// 成功换端口时把结果写回 settings（调用方负责），下次启动直接用它。
+fn bind_with_fallback(preferred: u16) -> Result<(tiny_http::Server, u16), String> {
+    let mut first_err: Option<String> = None;
+    // 首选 + 其后 300 个 + 前面 300 个。
+    // 范围要够大：Windows 保留段一次能占 200 个端口（本机是 8776-8975），±20 会全落在段内。
+    let mut candidates: Vec<u16> = Vec::new();
+    candidates.push(preferred);
+    for d in 1..=300u16 {
+        if let Some(p) = preferred.checked_add(d) {
+            candidates.push(p);
+        }
+        if let Some(p) = preferred.checked_sub(d) {
+            candidates.push(p);
+        }
+    }
+    for p in candidates {
+        match tiny_http::Server::http(("0.0.0.0", p)) {
+            Ok(s) => return Ok((s, p)),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e.to_string());
+                }
+            }
+        }
+    }
+    Err(crate::i18n::trf(
+        "err.gw.bind",
+        &[("e", &first_err.unwrap_or_default())],
+    ))
 }
 
 fn auth_token(req: &tiny_http::Request) -> String {
@@ -3507,6 +3560,23 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
                 Err(e) => reply_json(req, 400, &json!({ "error": e })),
             };
         }
+        "/proxy/account/claim-candidates" => {
+            // 自动探测用的候选套餐 id 列表（前端逐个试，每个候选各取一次验证码）。
+            return reply_json(req, 200, &json!({ "candidates": crate::claim::candidate_plan_ids(3, 1) }));
+        }
+        "/proxy/account/claim-diagnose" => {
+            let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let mid = match store::account_mid(&paths, &id) { Ok(m) => m, Err(e) => return reply_json(req, 400, &json!({ "error": e })) };
+            let acc = match store::load_account(&paths, &id) { Ok(a) => a, Err(e) => return reply_json(req, 400, &json!({ "error": e })) };
+            let d = crate::claim::diagnose_claimable(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid));
+            return reply_json(req, 200, &json!({
+                "hasData": d.has_data,
+                "planCount": d.plan_count,
+                "credentialOk": d.credential_ok,
+                "reason": d.reason,
+            }));
+        }
         "/proxy/account/claim-refresh" => {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -4063,6 +4133,20 @@ data: {\"type\":\"message_stop\"}
         assert!(gw2.conv_block_till(10).is_none());
         // 无指纹 → 不熔断
         assert!(!gw2.note_conv_3012(None, "d"));
+    }
+
+    #[test]
+    fn bind_falls_back_when_preferred_port_unusable() {
+        // 首选端口被占/被系统保留时，应自动换一个能绑的端口，而不是整个起不来。
+        // 用一个已被占住的端口当首选（先占住它，再让绑定失败）。
+        let holder = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("占一个临时端口");
+        let taken = holder.local_addr().map(|a| a.port()).unwrap_or(0);
+        assert!(taken > 0);
+        let (server, port) = bind_with_fallback(taken).expect("应能回退到某个可用端口");
+        assert_ne!(port, taken, "首选端口被占时应换端口");
+        assert!(port > 0, "回退端口应为合法端口，实际 {port}");
+        drop(server);
+        drop(holder);
     }
 
     #[test]

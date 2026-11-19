@@ -27,6 +27,9 @@ struct PendingClaim {
     credentials: Value,
     config: Option<Value>,
     device_mid: String,
+    /// 自动探测用的候选 plan_id 列表（非空 = 拿到验证码后依次试）。
+    /// 上游不给活动列表时，用它免去手填活动 ID。
+    candidates: Vec<String>,
 }
 
 static PENDING_CLAIM: Mutex<Option<PendingClaim>> = Mutex::new(None);
@@ -267,6 +270,31 @@ async fn claim_refresh(id: String) -> Result<ClaimRefreshResult, String> {
     Ok(ClaimRefreshResult { plans, activated, activation_error })
 }
 
+/// 返回当前可用于「自动探测」的候选套餐 id 列表（按日期倒序）。
+///
+/// 上游 2026-11 起 preview 对部分账号不返回活动列表，但 billing/claim 仍按 plan_id
+/// 受理（无效 id 回 1001「套餐不存在」）。活动 id 形如 `zcode-v3-start-plan-<MMDD>`
+/// （MMDD = 上线日）。前端拿这个清单逐个试，**每个候选各走一次验证码**——
+/// 上游的验证码参数是一次性的，不能一张码试多个。
+#[tauri::command]
+async fn claim_candidates() -> Result<Vec<String>, String> {
+    Ok(claim::candidate_plan_ids(3, 1))
+}
+
+#[tauri::command]
+async fn claim_diagnose(id: String) -> Result<serde_json::Value, String> {
+    let paths = Paths::detect();
+    let mid = store::account_mid(&paths, &id)?;
+    let acc = load_account(&paths, &id)?;
+    let d = claim::diagnose_claimable(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid));
+    Ok(json!({
+        "hasData": d.has_data,
+        "planCount": d.plan_count,
+        "credentialOk": d.credential_ok,
+        "reason": d.reason,
+    }))
+}
+
 #[tauri::command]
 async fn claim_start(
     app: AppHandle,
@@ -298,21 +326,31 @@ fn claim_start_inner(
     // 上游 2026-11 起对一部分账号 preview 直接不返回 data（活动列表拿不到），但
     // billing/claim 本身仍按 plan_id 受理（先校验证码、再校资格，无效 plan_id 会被上游拒绝）。
     // 所以：预览里找不到、但调用方显式给了 plan_id 时放行 —— 让上游自己做资格校验；
-    // 只有"没给 plan_id 且预览为空"才报「已不可领取」。
+    // 两样都没有时，按命名规律造候选（见 claim::candidate_plan_ids）。
+    //
+    // ⚠ 上游的**验证码参数是一次性的**：一张码只能提交一次。所以一次 claim 流程只能试
+    // 一个候选 —— 命中不了的（回 1001）由前端再发一轮 claim_start 试下一个候选
+    // （每轮重新取验证码）。候选清单在这里一次性交给前端，避免前端自己猜命名规律。
     let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid.clone()))
         .unwrap_or_default();
     let plan_id_trim = plan_id.trim().to_string();
-    let (pending_plan_id, display) = match plans.iter().find(|p| p.plan_id == plan_id) {
+    let (pending_plan_id, display, candidates) = match plans.iter().find(|p| p.plan_id == plan_id) {
         Some(p) => (
             p.plan_id.clone(),
             if p.name.is_empty() { p.plan_id.clone() } else { p.name.clone() },
+            Vec::new(),
         ),
         None => {
             if plan_id_trim.is_empty() {
-                return Err(i18n::tr("err.claim.gone"));
+                // 自动探测：候选按日期倒序（越新越前）。
+                let cands = claim::candidate_plan_ids(3, 1);
+                flowlog::log("claim", "auto-probe", &format!("预览无可领套餐，候选 {} 个（每轮取一次验证码）", cands.len()));
+                let head = cands.first().cloned().unwrap_or_default();
+                (head.clone(), head, cands)
+            } else {
+                flowlog::log("claim", "manual-plan", &format!("预览未列出，按显式 plan_id 领取: {plan_id_trim}"));
+                (plan_id_trim.clone(), plan_id_trim.clone(), Vec::new())
             }
-            flowlog::log("claim", "manual-plan", &format!("预览未列出，按显式 plan_id 领取: {plan_id_trim}"));
-            (plan_id_trim.clone(), plan_id_trim.clone())
         }
     };
 
@@ -324,6 +362,7 @@ fn claim_start_inner(
         credentials: acc.credentials,
         config: acc.config,
         device_mid: mid,
+        candidates,
     });
     // 桌面：弹独立验证码子窗（滑块被拦时用户滑一下，无感验证时后台静默完成）。
     // 移动端：Tauri 开不了子窗 —— 返回 inline 标记，主窗口把 captcha.html 铺成
@@ -358,6 +397,9 @@ async fn claim_captcha_submit(
 ) -> Result<serde_json::Value, String> {
     let pending = pending_guard().take().ok_or_else(|| i18n::tr("err.claim.none_pending"))?;
     let paths = Paths::detect();
+    // 一次验证码只能试一个候选（上游的验证码参数是一次性的）。
+    // 命中不了（1001 套餐不存在）时，把候选清单连同"下一个"一起回给前端，
+    // 由前端再发一轮 claim_start（重新取验证码）试下一个。
     let res = claim::submit_claim(
         &paths.home,
         &pending.credentials,
@@ -393,12 +435,24 @@ async fn claim_captcha_submit(
             p
         }
         Err(e) => {
-            let p = claim::failure_payload(
+            let mut p = claim::failure_payload(
                 &pending.account_id,
                 &pending.account_name,
                 &pending.plan_name,
                 &e,
             );
+            // 1001 = 这个候选套餐不存在（活动没上线/已过期）。还有候选就告诉前端
+            // "下一个该试谁"，前端会重新走一轮 claim_start（重新取验证码）继续试。
+            if e.code == 1001 && !pending.candidates.is_empty() {
+                let next = pending.candidates[1..].to_vec();
+                if let Some(obj) = p.as_object_mut() {
+                    obj.insert("nextCandidates".into(), Value::from(next));
+                    obj.insert("retryable".into(), Value::Bool(true));
+                    // 前端会自动换下一个候选重试，这一轮先别弹失败提示。
+                    obj.insert("silent".into(), Value::Bool(true));
+                }
+                crate::flowlog::log("claim", "candidate-miss", &pending.plan_id);
+            }
             claim::record_result(&p);
             let _ = app.emit("claim://result", &p);
             return Ok(p);
@@ -1830,6 +1884,8 @@ pub fn run() {
             claim_preview,
             claim_refresh,
             claim_start,
+            claim_candidates,
+            claim_diagnose,
             claim_captcha_config,
             claim_captcha_submit,
             claim_cancel,
